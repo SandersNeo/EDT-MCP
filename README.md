@@ -6,8 +6,7 @@ MCP (Model Context Protocol) server plugin for 1C:EDT, enabling AI assistants (C
 
 > [!IMPORTANT]
 > **EDT version compatibility:**
-> EDT 2025.x is supported up to and including plugin version **1.26.1**.
-> Starting from plugin version **1.27.0**, only **EDT 2026.1+** is supported.
+> EDT 2025.2+ is supported
 
 ## Features
 
@@ -30,8 +29,6 @@ MCP (Model Context Protocol) server plugin for 1C:EDT, enabling AI assistants (C
 - 🛠️ **Tool Management** - Enable/disable tools by group, presets (Analysis Only, Code Review, Development), per-tool parameter defaults
 
 ## Installation
-
-**Only EDT 2025.2+**
 
 ### From Update Site
 
