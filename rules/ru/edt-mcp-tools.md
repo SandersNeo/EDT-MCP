@@ -2,7 +2,7 @@
 
 > Источник истины — раздел «Available Tools» в `README.md` репозитория EDT-MCP. Если расходится с этим файлом — верь README.
 >
-> Всего инструментов: **56**, разбиты на 9 групп.
+> Всего инструментов: **57**, разбиты на 9 групп.
 
 ## Префиксы имён в разных клиентах
 
@@ -27,6 +27,7 @@ MCP-клиенты именуют инструменты по-разному. Р
 | «Покажи код модуля целиком» | сначала `get_module_structure` (карта), потом `read_module_source` только если действительно нужен весь файл | Экономия токенов |
 | «Измени код в методе» | `read_method_source` → `write_module_source` с `mode: searchReplace` | См. `edt-mcp-write-safety.md` |
 | «Переименуй / удали объект метаданных» | `rename_metadata_object` / `delete_metadata_object` **без** `confirm` (preview) → тот же вызов с `confirm: true` | Ручная правка XML каскадно ломает ссылки |
+| «Создай новый объект» | `create_metadata_object` | Дефолтное наполнение EDT + корректный UUID; не собирай `.mdo` руками |
 | «Добавь реквизит» | `add_metadata_attribute` | Не редактируй `.mdo` руками |
 | «Проверь запрос 1С» | `validate_query` (для СКД — `dcsMode: true`) | Перед вставкой текста запроса в код |
 | «Что в этой форме?» | `get_form_layout_snapshot` с `mode: compact` (YAML); `get_form_screenshot` если нужен визуал | YAML дешевле PNG |
@@ -43,7 +44,7 @@ MCP-клиенты именуют инструменты по-разному. Р
 
 | Пресет | Что выключено |
 |---|---|
-| **All Tools** | Ничего (все 56 инструментов) |
+| **All Tools** | Ничего (все 57 инструментов) |
 | **Analysis Only** | Группы Applications & Testing, Debugging, BSL Code, Refactoring, Translation + `export_configuration_to_xml` + `import_configuration_from_xml`. Доступны: Core/Project (кроме export/import), Errors & Problems, Code Intelligence, Tags |
 | **Code Review** | То же, что Analysis Only, **минус** добавляются доступными все инструменты BSL Code **кроме** `write_module_source`. То есть доступны `read_method_source`, `read_module_source`, `get_module_structure`, `list_modules`, `search_in_code`, `get_method_call_hierarchy`, `go_to_definition`, `get_symbol_info`, `get_form_layout_snapshot`, `get_form_screenshot`, `validate_query` |
 | **Development** | Только группа Debugging (включая `debug_yaxunit_tests`, `start_profiling`, `get_profiling_results`). Refactoring, Translation, BSL Code, Applications — доступны |
@@ -151,13 +152,14 @@ MCP-клиенты именуют инструменты по-разному. Р
 | `get_form_screenshot` | PNG формы из WYSIWYG (embedded image resource) | Когда нужен визуальный контекст |
 | `validate_query` | Проверка текста запроса 1С (синтаксис + семантика). Параметр `dcsMode: true` — для запросов СКД | **Перед** вставкой нового запроса в код |
 
-### 8. Refactoring — рефакторинг метаданных (3)
+### 8. Refactoring — рефакторинг метаданных (4)
 
 | Инструмент | Назначение | Когда использовать |
 |---|---|---|
 | `rename_metadata_object` | Переименование с каскадным обновлением (BSL-код, формы, метаданные). Workflow: 1) вызов без `confirm` — preview всех change points с индексами; 2) (опционально) `disableIndices: "2,3,5"` для пропуска отдельных изменений; 3) `confirm: true`. Параметр `maxResults` (default 20, 0 = без лимита) ограничивает preview. Поддерживает русские FQN | **Только** так переименовывать; ручная правка XML опасна |
 | `delete_metadata_object` | Удаление с очисткой ссылок. Аналогичный workflow preview → confirm | Аналогично |
 | `add_metadata_attribute` | Добавить реквизит в объект (Catalog, Document, Register, ...) | Вместо ручного редактирования `.mdo` |
+| `create_metadata_object` | Создать новый top-level объект с дефолтным наполнением EDT. Поддерживаемые типы: `Catalog`, `Document`, `InformationRegister`, `AccumulationRegister`, `Enum`, `CommonModule`, `Report`, `DataProcessor`. Параметры: `metadataType`, `name`, опц. `synonym`, `comment`, `language`. UUID генерируется автоматически | Вместо ручной сборки нового `.mdo`; после — прогнать `get_project_errors` |
 
 ### 9. Translation (LanguageTool) — перевод (3)
 
