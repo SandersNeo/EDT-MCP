@@ -8,16 +8,22 @@ package com.ditrix.edt.mcp.server.tools.impl;
 
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.stream.Collectors;
 
 import org.eclipse.core.resources.IProject;
 import org.eclipse.core.resources.IWorkspace;
 import org.eclipse.core.resources.ResourcesPlugin;
+import org.eclipse.core.runtime.IProgressMonitor;
 
+import com._1c.g5.v8.bm.core.IBmTransaction;
+import com._1c.g5.v8.bm.integration.AbstractBmTask;
+import com._1c.g5.v8.bm.integration.IBmModel;
+import com._1c.g5.v8.dt.core.platform.IBmModelManager;
 import com._1c.g5.v8.dt.validation.marker.IMarkerManager;
+import com._1c.g5.v8.dt.validation.marker.Marker;
 import com._1c.g5.v8.dt.validation.marker.MarkerSeverity;
 import com.e1c.g5.v8.dt.check.settings.ICheckRepository;
 import com.e1c.g5.v8.dt.check.settings.CheckUid;
@@ -39,6 +45,14 @@ import com.google.gson.JsonParser;
 /**
  * Tool to get detailed project errors with optional filters.
  * Uses EDT IMarkerManager for accessing configuration problems.
+ *
+ * <p>Marker presentation ({@link Marker#getObjectPresentation()}) is resolved lazily
+ * against the BM model and therefore must be read inside a BM read transaction.
+ * Markers restored from the persisted marker index (e.g. right after EDT startup) have
+ * a {@code null} {@code resolvedDataCache}; reading their presentation outside a
+ * transaction throws a {@link NullPointerException} that aborts the whole stream.
+ * To avoid this, markers are collected per project inside
+ * {@link IBmModel#executeReadonlyTask(AbstractBmTask)}.</p>
  */
 public class GetProjectErrorsTool implements IMcpTool
 {
@@ -65,7 +79,7 @@ public class GetProjectErrorsTool implements IMcpTool
         return JsonSchemaBuilder.object()
             .stringProperty("projectName", "Filter by project name (optional)") //$NON-NLS-1$ //$NON-NLS-2$
             .stringProperty("severity", "Filter by severity: ERRORS, BLOCKER, CRITICAL, MAJOR, MINOR, TRIVIAL (optional)") //$NON-NLS-1$ //$NON-NLS-2$
-            .stringProperty("checkId", "Filter by check ID substring (e.g. 'ql-temp-table-index') (optional)") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty("checkId", "Filter by check ID substring. Matches either the symbolic check id (e.g. 'ql-temp-table-index') or the short UID (e.g. 'SU23') (optional)") //$NON-NLS-1$ //$NON-NLS-2$
             .stringArrayProperty("objects", "Filter by object FQNs (e.g. ['Document.SalesOrder', 'Catalog.Products']). Russian type names supported (e.g. 'Документ.ПродажаТоваров'). Returns errors only from these objects.") //$NON-NLS-1$ //$NON-NLS-2$
             .integerProperty("limit", "Maximum number of results (default: 100, max: 1000)") //$NON-NLS-1$ //$NON-NLS-2$
             .build();
@@ -158,7 +172,8 @@ public class GetProjectErrorsTool implements IMcpTool
                 return "# Error\n\nIMarkerManager service is not available"; //$NON-NLS-1$
             }
             
-            ICheckRepository checkRepository = Activator.getDefault().getCheckRepository();
+            final ICheckRepository checkRepository = Activator.getDefault().getCheckRepository();
+            IBmModelManager bmModelManager = Activator.getDefault().getBmModelManager();
             
             IWorkspace workspace = ResourcesPlugin.getWorkspace();
             
@@ -175,6 +190,8 @@ public class GetProjectErrorsTool implements IMcpTool
                     // Invalid severity, will show all
                 }
             }
+            final MarkerSeverity finalSeverityFilter = severityFilter;
+            final String finalCheckId = checkId;
             
             // Validate project if specified
             if (projectName != null && !projectName.isEmpty())
@@ -186,10 +203,6 @@ public class GetProjectErrorsTool implements IMcpTool
                 }
             }
             
-            // Collect errors from EDT MarkerManager using proper stream operations
-            final MarkerSeverity finalSeverityFilter = severityFilter;
-            final String finalCheckId = checkId;
-            final String finalProjectName = projectName;
             // Normalize object FQNs to support both English and Russian metadata type names.
             // For each input FQN, generate all variants (original + English + Russian, lowercased)
             // so we can match markers regardless of the configuration language.
@@ -203,109 +216,78 @@ public class GetProjectErrorsTool implements IMcpTool
                 }
             }
             
-            // Use filter + limit instead of forEach with early return (which doesn't work)
-            final ICheckRepository finalCheckRepo = checkRepository;
-            List<ErrorInfo> errors = markerManager.markers()
-                .filter(marker -> {
-                    // Get project
-                    IProject markerProject = marker.getProject();
-                    if (markerProject == null)
+            // Group markers by project in a single pass. getProject() does not touch
+            // resolvedDataCache, so this is safe outside a BM transaction. Grouping once avoids
+            // re-streaming all markers per project (previously O(markers x projects)).
+            // Marker presentation must still be resolved inside a BM read transaction bound to
+            // a single project's model, so processing below stays project by project.
+            Map<IProject, List<Marker>> markersByProject = new LinkedHashMap<>();
+            markerManager.markers().forEach(marker -> {
+                IProject markerProject = marker.getProject();
+                if (markerProject == null || !markerProject.exists())
+                {
+                    return;
+                }
+                if (projectName != null && !projectName.isEmpty()
+                    && !projectName.equals(markerProject.getName()))
+                {
+                    return;
+                }
+                markersByProject.computeIfAbsent(markerProject, k -> new ArrayList<>()).add(marker);
+            });
+            
+            final List<ErrorInfo> errors = new ArrayList<>();
+            // Markers whose presentation could not be resolved even inside a transaction.
+            // They are NOT dropped, but they are surfaced differently depending on context,
+            // so we track the two cases separately to keep the warning text honest:
+            //  - unresolvedShown: reported in the table with a "<unresolved: ...>" placeholder;
+            //  - unresolvedFilteredOut: excluded from the result because an explicit objects
+            //    filter is active and the location could not be resolved to test membership.
+            final int[] unresolvedShown = {0};
+            final int[] unresolvedFilteredOut = {0};
+            
+            for (Map.Entry<IProject, List<Marker>> entry : markersByProject.entrySet())
+            {
+                if (errors.size() >= limit)
+                {
+                    break;
+                }
+                
+                final List<Marker> projectMarkers = entry.getValue();
+                final int remaining = limit - errors.size();
+                
+                // Resolve the project's BM model so getObjectPresentation() can lazily
+                // resolve the marker target inside a read transaction. The getModel(IProject)
+                // overload is the idiomatic path used across the plugin (FindReferencesTool,
+                // AddMetadataAttributeTool, tag tools), so no IDtProjectManager is needed.
+                IBmModel bmModel = bmModelManager != null ? bmModelManager.getModel(entry.getKey()) : null;
+                
+                Runnable collector = () -> projectMarkers.stream()
+                    .map(marker -> buildIfMatches(marker, finalSeverityFilter, finalCheckId,
+                        finalObjects, checkRepository, unresolvedShown, unresolvedFilteredOut))
+                    .filter(error -> error != null)
+                    .limit(remaining)
+                    .forEach(errors::add);
+                
+                if (bmModel != null)
+                {
+                    bmModel.executeReadonlyTask(new AbstractBmTask<Void>("CollectProjectErrors") //$NON-NLS-1$
                     {
-                        return false;
-                    }
-                    
-                    // Check project filter
-                    if (finalProjectName != null && !finalProjectName.isEmpty() && 
-                        !markerProject.getName().equals(finalProjectName))
-                    {
-                        return false;
-                    }
-                    
-                    // Check severity filter
-                    MarkerSeverity markerSeverity = marker.getSeverity();
-                    if (finalSeverityFilter != null && markerSeverity != finalSeverityFilter)
-                    {
-                        return false;
-                    }
-                    
-                    // Check checkId filter
-                    String markerCheckId = marker.getCheckId();
-                    if (finalCheckId != null && !finalCheckId.isEmpty())
-                    {
-                        if (markerCheckId == null || 
-                            !markerCheckId.toLowerCase().contains(finalCheckId.toLowerCase()))
+                        @Override
+                        public Void execute(IBmTransaction transaction, IProgressMonitor monitor)
                         {
-                            return false;
+                            collector.run();
+                            return null;
                         }
-                    }
-                    
-                    // Check objects filter (FQN matching)
-                    if (!finalObjects.isEmpty())
-                    {
-                        String objectPresentation = marker.getObjectPresentation();
-                        if (objectPresentation == null || objectPresentation.isEmpty())
-                        {
-                            return false;
-                        }
-
-                        // Lowercase once for all comparisons
-                        String presentationLower = objectPresentation.toLowerCase();
-
-                        // Check if any FQN variant matches the object presentation
-                        // All variants in finalObjects are already lowercased
-                        boolean matchesAnyObject = false;
-                        for (String fqnVariant : finalObjects)
-                        {
-                            if (presentationLower.contains(fqnVariant))
-                            {
-                                matchesAnyObject = true;
-                                break;
-                            }
-                        }
-                        if (!matchesAnyObject)
-                        {
-                            return false;
-                        }
-                    }
-                    
-                    return true;
-                })
-                .limit(limit)
-                .map(marker -> {
-                    ErrorInfo error = new ErrorInfo();
-                    String shortUid = marker.getCheckId() != null ? marker.getCheckId() : ""; //$NON-NLS-1$
-                    error.checkCode = shortUid;
-                    
-                    // Try to convert short UID (e.g. "SU23") to symbolic check ID (e.g. "bsl-legacy-check-expression-type")
-                    if (finalCheckRepo != null && !shortUid.isEmpty() && marker.getProject() != null)
-                    {
-                        try
-                        {
-                            CheckUid checkUid = finalCheckRepo.getUidForShortUid(shortUid, marker.getProject());
-                            if (checkUid != null)
-                            {
-                                error.checkId = checkUid.getCheckId();
-                            }
-                        }
-                        catch (Exception e)
-                        {
-                            // Ignore - will use short UID instead
-                        }
-                    }
-                    
-                    // Check if documentation exists for this check
-                    error.hasDocumentation = false;
-                    if (error.checkId != null && !error.checkId.isEmpty())
-                    {
-                        error.hasDocumentation = GetCheckDescriptionTool.hasCheckDocumentation(error.checkId);
-                    }
-                    
-                    error.message = marker.getMessage() != null ? marker.getMessage() : ""; //$NON-NLS-1$
-                    error.objectPresentation = marker.getObjectPresentation() != null ? 
-                        marker.getObjectPresentation() : ""; //$NON-NLS-1$
-                    return error;
-                })
-                .collect(Collectors.toList());
+                    });
+                }
+                else
+                {
+                    // Not an EDT project (no BM model): best effort. Per-marker access is
+                    // still guarded, so an unresolved marker is reported, never dropped.
+                    collector.run();
+                }
+            }
             
             // Build Markdown response for better readability and context efficiency
             StringBuilder md = new StringBuilder();
@@ -357,6 +339,21 @@ public class GetProjectErrorsTool implements IMcpTool
                 }
             }
             
+            // Surface unresolved markers explicitly instead of silently dropping them.
+            // Two distinct cases, reported separately so each warning matches reality.
+            if (unresolvedShown[0] > 0)
+            {
+                md.append("\n> ⚠️ ").append(unresolvedShown[0]) //$NON-NLS-1$
+                  .append(" marker(s) could not be resolved and are shown with a placeholder location. ") //$NON-NLS-1$
+                  .append("Run clean_project / revalidate_objects to refresh them."); //$NON-NLS-1$
+            }
+            if (unresolvedFilteredOut[0] > 0)
+            {
+                md.append("\n> ⚠️ ").append(unresolvedFilteredOut[0]) //$NON-NLS-1$
+                  .append(" marker(s) were excluded from the object filter because their location could not be resolved. ") //$NON-NLS-1$
+                  .append("Run clean_project / revalidate_objects, or remove the objects filter, to include them."); //$NON-NLS-1$
+            }
+            
             return md.toString();
         }
         catch (Exception e)
@@ -367,9 +364,158 @@ public class GetProjectErrorsTool implements IMcpTool
     }
     
     /**
+     * Applies the severity/checkId/objects filters to a single marker and, if it passes,
+     * builds its {@link ErrorInfo}. Returns {@code null} when the marker is filtered out.
+     *
+     * <p>Must be called inside a BM read transaction so that
+     * {@link Marker#getObjectPresentation()} can resolve. The symbolic check id is resolved
+     * exactly once here and reused for both the checkId filter and the resulting
+     * {@link ErrorInfo}, avoiding a second {@link ICheckRepository#getUidForShortUid} call.
+     * The filter order (severity -> checkId -> objects) is preserved so the
+     * {@code unresolvedFilteredOut} counter keeps the same semantics.</p>
+     */
+    static ErrorInfo buildIfMatches(Marker marker, MarkerSeverity severityFilter, String checkId,
+        Set<String> objects, ICheckRepository checkRepository, int[] unresolvedShown, int[] unresolvedFilteredOut)
+    {
+        // Severity filter
+        if (severityFilter != null && marker.getSeverity() != severityFilter)
+        {
+            return null;
+        }
+        
+        // Resolve the symbolic check id once; reused below for the checkId filter and display.
+        String shortUid = marker.getCheckId() != null ? marker.getCheckId() : ""; //$NON-NLS-1$
+        String symbolicCheckId = resolveSymbolicCheckId(marker, shortUid, checkRepository);
+        
+        // checkId filter: match either the short UID (e.g. "SU23") or the symbolic id
+        // (e.g. "semicolon-missing"). The short UID alone is rarely what callers type.
+        if (checkId != null && !checkId.isEmpty() && !checkIdMatches(shortUid, symbolicCheckId, checkId))
+        {
+            return null;
+        }
+        
+        // Resolve the object presentation once; reused for the objects filter and the ErrorInfo.
+        // Failure handling differs by context (see below), so we only record the outcome here.
+        String objectPresentation = null;
+        boolean presentationResolved;
+        try
+        {
+            String p = marker.getObjectPresentation();
+            objectPresentation = p != null ? p : ""; //$NON-NLS-1$
+            presentationResolved = true;
+        }
+        catch (Exception e)
+        {
+            presentationResolved = false;
+        }
+        
+        // Objects filter (FQN matching against the resolved object presentation)
+        if (!objects.isEmpty())
+        {
+            if (!presentationResolved)
+            {
+                // Cannot resolve the location, so we cannot decide membership for an
+                // explicit object filter. The marker is excluded from the result; count it
+                // separately so the caller is warned that it was filtered out, not shown.
+                unresolvedFilteredOut[0]++;
+                return null;
+            }
+            if (objectPresentation.isEmpty())
+            {
+                return null;
+            }
+            
+            String presentationLower = objectPresentation.toLowerCase();
+            boolean matched = false;
+            for (String fqnVariant : objects)
+            {
+                if (presentationLower.contains(fqnVariant))
+                {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched)
+            {
+                return null;
+            }
+        }
+        
+        // Build the ErrorInfo, reusing the already resolved symbolic check id and presentation.
+        ErrorInfo error = new ErrorInfo();
+        error.checkCode = shortUid;
+        error.checkId = symbolicCheckId;
+        error.hasDocumentation = symbolicCheckId != null && !symbolicCheckId.isEmpty()
+            && GetCheckDescriptionTool.hasCheckDocumentation(symbolicCheckId);
+        error.message = marker.getMessage() != null ? marker.getMessage() : ""; //$NON-NLS-1$
+        if (presentationResolved)
+        {
+            error.objectPresentation = objectPresentation;
+        }
+        else
+        {
+            // No objects filter was active (otherwise we would have returned above): keep the
+            // marker with a placeholder location instead of dropping it, and count it.
+            unresolvedShown[0]++;
+            error.objectPresentation = unresolvedPlaceholder(marker);
+        }
+        return error;
+    }
+    
+    /**
+     * Resolves the symbolic check id (e.g. "bsl-legacy-check-expression-type") for a marker's
+     * short UID (e.g. "SU23") exactly once. Returns {@code null} when it cannot be resolved.
+     */
+    static String resolveSymbolicCheckId(Marker marker, String shortUid, ICheckRepository checkRepository)
+    {
+        if (checkRepository == null || shortUid == null || shortUid.isEmpty() || marker.getProject() == null)
+        {
+            return null;
+        }
+        try
+        {
+            CheckUid uid = checkRepository.getUidForShortUid(shortUid, marker.getProject());
+            return uid != null ? uid.getCheckId() : null;
+        }
+        catch (Exception e)
+        {
+            // Ignore - caller falls back to the short UID
+            return null;
+        }
+    }
+    
+    /**
+     * Returns true when the user supplied checkId substring matches either the marker
+     * short UID or its already resolved symbolic check id.
+     */
+    static boolean checkIdMatches(String shortUid, String symbolicCheckId, String checkId)
+    {
+        String needle = checkId.toLowerCase();
+        if (shortUid != null && shortUid.toLowerCase().contains(needle))
+        {
+            return true;
+        }
+        if (symbolicCheckId != null && symbolicCheckId.toLowerCase().contains(needle))
+        {
+            return true;
+        }
+        return false;
+    }
+    
+    /**
+     * Placeholder location for a marker whose {@link Marker#getObjectPresentation()} could not
+     * be resolved, so the marker is reported instead of being dropped.
+     */
+    static String unresolvedPlaceholder(Marker marker)
+    {
+        IProject project = marker.getProject();
+        return "<unresolved: " + (project != null ? project.getName() : "?") + ">"; //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+    }
+    
+    /**
      * Helper class to store error info.
      */
-    private static class ErrorInfo
+    static class ErrorInfo
     {
         String checkCode;          // Short UID like "SU23"
         String checkId;            // Symbolic ID like "bsl-legacy-check-expression-type"
