@@ -19,6 +19,7 @@ import com.ditrix.edt.mcp.server.protocol.JsonUtils;
 import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
 import com.ditrix.edt.mcp.server.utils.DebugSessionRegistry;
+import com.ditrix.edt.mcp.server.utils.DebugTargetResolver;
 import com.ditrix.edt.mcp.server.utils.VariableSerializer;
 
 /**
@@ -114,13 +115,18 @@ public class GetVariablesTool implements IMcpTool
             }
             else
             {
-                // Fallback: if exactly one active debug launch is suspended, use its top frame.
-                String appId = DebugSessionRegistry.findLoneActiveApplicationId();
-                DebugSessionRegistry.SuspendSnapshot snap = appId != null ? registry.getSnapshot(appId) : null;
+                // Fallback: auto-resolve the single active debug session through the
+                // SAME blank-id policy every applicationId-based tool uses
+                // (DebugTargetResolver: the lone Eclipse launch, else the lone
+                // server target) and read its snapshot under the canonical key —
+                // replaces a hand-rolled condensed copy of that policy.
+                DebugTargetResolver.Resolution res = DebugTargetResolver.resolve(null);
+                DebugSessionRegistry.SuspendSnapshot snap =
+                    res != null ? registry.getSnapshot(res.canonicalId) : null;
                 if (snap == null)
                 {
                     return ToolResult.error("Provide frameRef or threadId — no single suspended debug " //$NON-NLS-1$
-                        + "launch available for auto-resolution. Call wait_for_break first.").toJson(); //$NON-NLS-1$
+                        + "session available for auto-resolution. Call wait_for_break first.").toJson(); //$NON-NLS-1$
                 }
                 IStackFrame[] frames = snap.thread.getStackFrames();
                 if (frames.length == 0)

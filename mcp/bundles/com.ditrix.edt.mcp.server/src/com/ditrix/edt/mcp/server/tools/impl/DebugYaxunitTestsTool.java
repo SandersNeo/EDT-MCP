@@ -66,7 +66,9 @@ public class DebugYaxunitTestsTool implements IMcpTool
                 "Comma-separated test names as Module.Method (recommended: pin to one test for a predictable cycle).") //$NON-NLS-1$
             .booleanProperty("updateBeforeLaunch", //$NON-NLS-1$
                 "Default true: terminate any live client and run a silent DB update first so no modal " //$NON-NLS-1$
-                    + "'Update database?' dialog blocks the call; false keeps legacy delegate behaviour.") //$NON-NLS-1$
+                    + "'Update database?' dialog blocks the call; false keeps legacy delegate behaviour — " //$NON-NLS-1$
+                    + "no client sweep, no auto-confirmed update dialog; platform dialogs may appear.") //$NON-NLS-1$
+            .stringProperty("updateScope", RunYaxunitTestsTool.UPDATE_SCOPE_DESCRIPTION) //$NON-NLS-1$
             .build();
     }
 
@@ -85,6 +87,7 @@ public class DebugYaxunitTestsTool implements IMcpTool
         putIfPresent(forwarded, "modules", params.get("modules")); //$NON-NLS-1$ //$NON-NLS-2$
         putIfPresent(forwarded, "tests", params.get("tests")); //$NON-NLS-1$ //$NON-NLS-2$
         putIfPresent(forwarded, "updateBeforeLaunch", params.get("updateBeforeLaunch")); //$NON-NLS-1$ //$NON-NLS-2$
+        putIfPresent(forwarded, "updateScope", params.get("updateScope")); //$NON-NLS-1$ //$NON-NLS-2$
         forwarded.put("debug", "true"); //$NON-NLS-1$ //$NON-NLS-2$
         return DELEGATE.execute(forwarded);
     }
