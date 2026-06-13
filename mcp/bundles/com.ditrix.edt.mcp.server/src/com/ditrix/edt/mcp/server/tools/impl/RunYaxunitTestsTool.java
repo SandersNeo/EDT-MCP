@@ -21,12 +21,17 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.eclipse.core.resources.IProject;
 import org.eclipse.core.runtime.CoreException;
+import org.eclipse.core.runtime.IProgressMonitor;
+import org.eclipse.core.runtime.IStatus;
 import org.eclipse.core.runtime.NullProgressMonitor;
+import org.eclipse.core.runtime.Status;
+import org.eclipse.core.runtime.jobs.Job;
 import org.eclipse.debug.core.DebugPlugin;
 import org.eclipse.debug.core.ILaunch;
 import org.eclipse.debug.core.ILaunchConfiguration;
@@ -47,6 +52,7 @@ import com.ditrix.edt.mcp.server.utils.JUnitTestResults;
 import com.ditrix.edt.mcp.server.utils.JUnitXmlParser;
 import com.ditrix.edt.mcp.server.utils.LaunchLifecycleUtils;
 import com.ditrix.edt.mcp.server.utils.LaunchUpdateDialogAutoConfirmer;
+import com.ditrix.edt.mcp.server.utils.LaunchLifecycleUtils.PrepInFlight;
 import com.ditrix.edt.mcp.server.utils.LaunchLifecycleUtils.PreLaunchResult;
 import com.ditrix.edt.mcp.server.utils.LaunchConfigUtils;
 import com.ditrix.edt.mcp.server.utils.ProjectContext;
@@ -105,7 +111,12 @@ public class RunYaxunitTestsTool implements IMcpTool
                + "Polls for up to `timeout` seconds, then returns the report or **Pending** " //$NON-NLS-1$
                + "(call again with identical arguments to keep waiting; the launch is not terminated). " //$NON-NLS-1$
                + "Pass `debug=true` to instead launch in DEBUG mode (breakpoints fire) and return at once " //$NON-NLS-1$
-               + "so you can call wait_for_break. Requires an existing runtime-client launch configuration " //$NON-NLS-1$
+               + "so you can call wait_for_break. " //$NON-NLS-1$
+               + "The pre-launch auto-chain (updateBeforeLaunch=true, default) recomputes only projects " //$NON-NLS-1$
+               + "that changed since the last prepared run; the first call after EDT starts always " //$NON-NLS-1$
+               + "recomputes fully. If recompute+update exceeds 25s the tool returns **Pending** " //$NON-NLS-1$
+               + "immediately — call again with the same arguments; preparation continues in the background. " //$NON-NLS-1$
+               + "Requires an existing runtime-client launch configuration " //$NON-NLS-1$
                + "and the YAXUnit extension installed in the infobase. " //$NON-NLS-1$
                + "Full parameters and examples: call get_tool_guide('run_yaxunit_tests')."; //$NON-NLS-1$
     }
@@ -484,35 +495,46 @@ public class RunYaxunitTestsTool implements IMcpTool
                 }
             }
 
-            // Phases 2 + 3 under the per-key lock — this serialises auto-chain
-            // and spawn across both YAXUnit tools for the same IB, and closes
-            // the narrow window between workingCopy.launch() and
-            // registerOwnedLaunch where a concurrent call could otherwise
-            // terminate this fresh launch before it's registered. Different
-            // (project, applicationId) pairs are unaffected.
+            // Phase 2: pre-launch preparation (terminate stale launch + recompute
+            // + DB update) runs in a background Job under a 25-second budget.
+            // The tool thread waits on the job's latch; if the prep is not done
+            // within the budget it returns a "Pending (preparation)" response and
+            // the caller retries with the same arguments. The launch (Phase 3) is
+            // NEVER run in the background — only the prep. A single in-flight
+            // entry per (project, applicationId) prevents a second job from
+            // starting while one is already running.
+            //
+            // Phase 3 (spawn) still runs under the per-key lock — this serialises
+            // the spawn across both YAXUnit tools for the same IB and closes the
+            // narrow window between workingCopy.launch() and registerOwnedLaunch
+            // where a concurrent call could otherwise terminate this launch before
+            // it's registered. Different (project, applicationId) pairs are unaffected.
             PreLaunchResult preLaunch = null;
             if (launch == null)
             {
+                if (updateBeforeLaunch)
+                {
+                    String prepKey = LaunchLifecycleUtils.prepKeyFor(projectName, applicationId);
+                    final ILaunchManager finalLaunchManager = launchManager;
+                    final IProject finalProject = project;
+                    final String finalApplicationId = applicationId;
+                    final IApplicationManager finalAppManager = appManager;
+                    final String finalUpdateScope = updateScope;
+                    final PreLaunchResult[] resultHolder = new PreLaunchResult[1];
+
+                    String pendingOrError = awaitPreparedOrPending(prepKey, projectName,
+                        finalLaunchManager, finalProject, finalApplicationId, finalAppManager,
+                        finalUpdateScope, "YAXUnit pre-launch preparation for " + projectName, //$NON-NLS-1$
+                        resultHolder);
+                    if (pendingOrError != null)
+                    {
+                        return pendingOrError;
+                    }
+                    preLaunch = resultHolder[0];
+                }
+
                 synchronized (LaunchLifecycleUtils.lockFor(projectName, applicationId))
                 {
-                    // Phase 2: auto-chain (LaunchLifecycleUtils.prepareForFreshLaunch
-                    // re-acquires the same monitor — Java synchronized is reentrant).
-                    if (updateBeforeLaunch)
-                    {
-                        int terminateTimeout = LaunchLifecycleUtils.getDefaultTerminateTimeoutSeconds();
-                        preLaunch = LaunchLifecycleUtils.prepareForFreshLaunch(launchManager,
-                            project, applicationId, appManager, terminateTimeout, updateScope);
-                        if (!preLaunch.isOk())
-                        {
-                            return ToolResult.error("Pre-launch preparation failed: " //$NON-NLS-1$
-                                + preLaunch.getError()
-                                + "\n\nIf the previous launch is stuck, call `terminate_launch` " //$NON-NLS-1$
-                                + "with `force=true` and retry. As a last resort, pass " //$NON-NLS-1$
-                                + "`updateBeforeLaunch=false` — but the EDT launch delegate may " //$NON-NLS-1$
-                                + "then pop a modal dialog that blocks the MCP call.").toJson(); //$NON-NLS-1$
-                        }
-                    }
-
                     // Phase 3: re-check ACTIVE_LAUNCHES under JVM-wide sync (another
                     // thread may have spawned for the same runKey while we waited
                     // on the per-key lock), then either reuse or spawn.
@@ -638,23 +660,28 @@ public class RunYaxunitTestsTool implements IMcpTool
         // Suspend listener must be live before the launch starts producing events.
         DebugSessionRegistry.get().ensureListenerRegistered();
 
+        // Phase 2 (debug path): prep runs in a background Job under a 25-second
+        // budget, same as the RUN path. The sweep + launch (Phase 3) runs
+        // synchronously after prep completes, under the per-key lock.
         PreLaunchResult preLaunch = null;
+        if (updateBeforeLaunch)
+        {
+            String prepKey = LaunchLifecycleUtils.prepKeyFor(projectName, applicationId);
+            final PreLaunchResult[] resultHolder = new PreLaunchResult[1];
+
+            String pendingOrError = awaitPreparedOrPending(prepKey, projectName,
+                launchManager, project, applicationId, appManager,
+                updateScope, "YAXUnit debug pre-launch preparation for " + projectName, //$NON-NLS-1$
+                resultHolder);
+            if (pendingOrError != null)
+            {
+                return pendingOrError;
+            }
+            preLaunch = resultHolder[0];
+        }
+
         synchronized (LaunchLifecycleUtils.lockFor(projectName, applicationId))
         {
-            if (updateBeforeLaunch)
-            {
-                int terminateTimeout = LaunchLifecycleUtils.getDefaultTerminateTimeoutSeconds();
-                preLaunch = LaunchLifecycleUtils.prepareForFreshLaunch(launchManager, project,
-                    applicationId, appManager, terminateTimeout, updateScope);
-                if (!preLaunch.isOk())
-                {
-                    return ToolResult.error("Pre-launch preparation failed: " + preLaunch.getError() //$NON-NLS-1$
-                        + "\n\nIf the previous launch is stuck, call `terminate_launch` with `force=true` " //$NON-NLS-1$
-                        + "and retry. As a last resort, pass `updateBeforeLaunch=false` — but the EDT launch " //$NON-NLS-1$
-                        + "delegate may then pop a modal dialog that blocks the MCP call.").toJson(); //$NON-NLS-1$
-                }
-            }
-
             // Fresh-run guarantee — PART OF THE updateBeforeLaunch AUTO-CHAIN: with
             // updateBeforeLaunch=true a YAXUnit debug run is ALWAYS a new session —
             // detect and non-interactively terminate any existing live CLIENT session
@@ -725,6 +752,174 @@ public class RunYaxunitTestsTool implements IMcpTool
         }
         return buildDebugLaunchMarkdown(matchingConfig.getName(), projectName, applicationId,
             reportDir, junitFile, preLaunch);
+    }
+
+    /**
+     * Shared in-flight / budget / pending block for both the RUN and DEBUG paths.
+     *
+     * <p>Acquires (or creates) a {@link PrepInFlight} entry for {@code prepKey}
+     * via {@link java.util.concurrent.ConcurrentMap#computeIfAbsent}, ensuring only ONE
+     * background Job is ever scheduled for a given {@code (project, applicationId)} key
+     * regardless of how many concurrent tool threads arrive: the thread that wins the
+     * {@link PrepInFlight#started} CAS constructs and schedules the Job; every other
+     * thread simply awaits {@link PrepInFlight#latch} on the same entry.
+     *
+     * <p>A stale (completed-with-error or expired) entry is replaced atomically via
+     * {@link java.util.concurrent.ConcurrentMap#remove(Object, Object)} + retry before the
+     * {@code computeIfAbsent}:
+     * <ol>
+     *   <li>If the existing entry is done-with-error, surface the error ONCE,
+     *       remove the entry, and return the error string.</li>
+     *   <li>If the existing entry is expired, remove it atomically so a fresh
+     *       entry will be created.</li>
+     *   <li>Use {@code computeIfAbsent} to get-or-create atomically.</li>
+     *   <li>If this thread wins the {@code started} CAS, create and schedule the
+     *       Job; otherwise just await the latch.</li>
+     *   <li>If the budget expires before the Job completes, return the prep-pending
+     *       message (caller returns Pending).</li>
+     *   <li>On Job completion: remove the entry (if still the same), check for
+     *       error; on success, store the {@link PreLaunchResult} in
+     *       {@code resultHolder[0]} and return {@code null} so the caller proceeds.</li>
+     * </ol>
+     *
+     * @param prepKey          the in-flight map key (project\u0000applicationId)
+     * @param projectName      project name (for log messages)
+     * @param launchManager    Eclipse launch manager passed through to
+     *                         {@link LaunchLifecycleUtils#prepareForFreshLaunch}
+     * @param project          project handle passed through to
+     *                         {@link LaunchLifecycleUtils#prepareForFreshLaunch}
+     * @param applicationId    application id passed through to
+     *                         {@link LaunchLifecycleUtils#prepareForFreshLaunch}
+     * @param appManager       application manager passed through to
+     *                         {@link LaunchLifecycleUtils#prepareForFreshLaunch}
+     * @param updateScope      updateScope value passed through to
+     *                         {@link LaunchLifecycleUtils#prepareForFreshLaunch}
+     * @param jobName          display name for the background Job
+     * @param resultHolder     single-element array; on success the
+     *                         {@link PreLaunchResult} is stored in {@code [0]}
+     * @return a non-{@code null} string (a Pending or error message) when the
+     *         caller must return immediately without proceeding to launch;
+     *         {@code null} when preparation completed successfully and the caller
+     *         may proceed
+     */
+    private static String awaitPreparedOrPending(String prepKey, String projectName,
+            ILaunchManager launchManager, IProject project, String applicationId,
+            IApplicationManager appManager, String updateScope, String jobName,
+            PreLaunchResult[] resultHolder)
+    {
+        // Stale-entry eviction loop: if an expired or done-with-error entry is in
+        // the map, remove it atomically so the computeIfAbsent below creates a fresh
+        // one. At most two iterations: one to detect + remove, one to proceed.
+        while (true)
+        {
+            PrepInFlight existing = LaunchLifecycleUtils.PREP_INFLIGHT.get(prepKey);
+            if (existing == null)
+            {
+                break; // nothing stale — fall through to computeIfAbsent
+            }
+            if (existing.done && existing.error != null)
+            {
+                // Surface the error ONCE; clear the entry so the next call retries.
+                if (LaunchLifecycleUtils.PREP_INFLIGHT.remove(prepKey, existing))
+                {
+                    return ToolResult.error("Pre-launch preparation failed: " + existing.error //$NON-NLS-1$
+                        + "\n\nIf the previous launch is stuck, call `terminate_launch` " //$NON-NLS-1$
+                        + "with `force=true` and retry. As a last resort, pass " //$NON-NLS-1$
+                        + "`updateBeforeLaunch=false` — but the EDT launch delegate may " //$NON-NLS-1$
+                        + "then pop a modal dialog that blocks the MCP call.").toJson(); //$NON-NLS-1$
+                }
+                continue; // another thread already replaced it — re-check
+            }
+            if (existing.isExpired())
+            {
+                // Atomically replace the expired entry; on failure another thread
+                // already replaced it, so re-check.
+                LaunchLifecycleUtils.PREP_INFLIGHT.remove(prepKey, existing);
+                continue;
+            }
+            break; // active (not done, not expired) — fall through to computeIfAbsent
+        }
+
+        // Atomically get-or-create.  Only the thread that wins
+        // entry.started.compareAndSet(false, true) schedules the Job.
+        PrepInFlight entry = LaunchLifecycleUtils.PREP_INFLIGHT.computeIfAbsent(
+            prepKey, k -> new PrepInFlight(System.currentTimeMillis()));
+
+        if (entry.started.compareAndSet(false, true))
+        {
+            // This thread won: create and schedule the background Job.
+            final PrepInFlight jobEntry = entry;
+            Job prepJob = new Job(jobName)
+            {
+                @Override
+                protected IStatus run(IProgressMonitor monitor)
+                {
+                    try
+                    {
+                        jobEntry.phase = "recompute"; //$NON-NLS-1$
+                        int terminateTimeout =
+                            LaunchLifecycleUtils.getDefaultTerminateTimeoutSeconds();
+                        PreLaunchResult result = LaunchLifecycleUtils.prepareForFreshLaunch(
+                            launchManager, project, applicationId,
+                            appManager, terminateTimeout, updateScope);
+                        jobEntry.phase = "db-update"; //$NON-NLS-1$
+                        resultHolder[0] = result;
+                        if (!result.isOk())
+                        {
+                            jobEntry.error = result.getError();
+                        }
+                    }
+                    catch (Throwable e)
+                    {
+                        // Throwable, not Exception: an Error escaping the prep must still
+                        // surface as a prep failure — otherwise the retry call would see
+                        // done-without-error and proceed as if preparation succeeded.
+                        jobEntry.error = e.getMessage() != null ? e.getMessage()
+                            : e.getClass().getSimpleName();
+                        Activator.logError("Pre-launch preparation job failed: " + projectName, e); //$NON-NLS-1$
+                    }
+                    finally
+                    {
+                        jobEntry.done = true;
+                        jobEntry.latch.countDown();
+                    }
+                    return Status.OK_STATUS;
+                }
+            };
+            prepJob.setPriority(Job.INTERACTIVE);
+            prepJob.schedule();
+        }
+        // else: another thread is already running the Job — just await the latch.
+
+        boolean done;
+        try
+        {
+            done = entry.latch.await(LaunchLifecycleUtils.PRELAUNCH_BUDGET_MS, TimeUnit.MILLISECONDS);
+        }
+        catch (InterruptedException ie)
+        {
+            Thread.currentThread().interrupt();
+            done = entry.done;
+        }
+        if (!done)
+        {
+            // Budget expired — return Pending so the caller retries.
+            return buildPrepPendingMessage(entry.elapsedSeconds(), entry.phase);
+        }
+        // Job completed within the budget.  Remove our entry (conditional so a
+        // concurrent expired-entry replacement is not accidentally dropped).
+        LaunchLifecycleUtils.PREP_INFLIGHT.remove(prepKey, entry);
+        if (entry.error != null)
+        {
+            return ToolResult.error("Pre-launch preparation failed: " + entry.error //$NON-NLS-1$
+                + "\n\nIf the previous launch is stuck, call `terminate_launch` " //$NON-NLS-1$
+                + "with `force=true` and retry. As a last resort, pass " //$NON-NLS-1$
+                + "`updateBeforeLaunch=false` — but the EDT launch delegate may " //$NON-NLS-1$
+                + "then pop a modal dialog that blocks the MCP call.").toJson(); //$NON-NLS-1$
+        }
+        // resultHolder[0] already set by the Job; null for the concurrent-waiter path
+        // (the original job-starter holds the result, but launch can proceed either way).
+        return null; // success — caller may proceed to launch
     }
 
     /** Markdown launch handle returned by DEBUG mode — readable, with the wait_for_break next step. */
@@ -920,6 +1115,31 @@ public class RunYaxunitTestsTool implements IMcpTool
                 + "Report directory: `" + reportDir + "`\n\n" //$NON-NLS-1$ //$NON-NLS-2$
                 + "Call `run_yaxunit_tests` again with the same arguments to wait further " //$NON-NLS-1$
                 + "and fetch the JUnit XML once the launch completes.\n"; //$NON-NLS-1$
+    }
+
+    /**
+     * Builds a Pending response for the pre-launch preparation phase (background
+     * recompute / DB update). The caller is instructed to retry with the SAME
+     * arguments — the in-flight job continues server-side and a follow-up call
+     * will either find the prep completed (and proceed to launch) or return
+     * another pending response until the budget is met.
+     *
+     * @param elapsedSeconds elapsed time since the background job started
+     * @param phase the current preparation phase label (e.g. {@code "recompute"} /
+     *            {@code "db-update"})
+     * @return a Markdown pending response matching the shape of
+     *         {@link #buildPendingMessage(Path)}
+     */
+    private static String buildPrepPendingMessage(long elapsedSeconds, String phase)
+    {
+        int retryAfter = 5;
+        return "**Pending:** Pre-launch preparation is still running " //$NON-NLS-1$
+            + "(phase: `" + (phase != null ? phase : "recompute") + "`" //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+            + ", elapsed: " + elapsedSeconds + "s).\n\n" //$NON-NLS-1$ //$NON-NLS-2$
+            + "The server is rebuilding changed projects and updating the infobase in the " //$NON-NLS-1$
+            + "background so the run starts against a fresh, up-to-date infobase. " //$NON-NLS-1$
+            + "Call `run_yaxunit_tests` again with the **same arguments** in ~" //$NON-NLS-1$
+            + retryAfter + "s to check for completion.\n"; //$NON-NLS-1$
     }
 
     /**

@@ -10,14 +10,17 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
+import java.util.stream.Collectors;
 
 import org.eclipse.core.resources.IProject;
 import org.eclipse.core.runtime.NullProgressMonitor;
@@ -74,6 +77,106 @@ public final class LaunchLifecycleUtils
      * practice (one per EDT launch configuration).
      */
     private static final ConcurrentMap<String, Object> KEY_LOCKS = new ConcurrentHashMap<>();
+
+    // =========================================================================
+    // Pre-launch preparation in-flight registry (Fix 2: 25 s budget + pending)
+    // =========================================================================
+
+    /**
+     * Budget (ms) the tool thread waits for the background pre-launch preparation
+     * job to finish before returning a {@code pending} response. 25 seconds is
+     * generous enough to cover a typical short recompute without hitting the MCP
+     * client's own call timeout.
+     */
+    public static final long PRELAUNCH_BUDGET_MS = 25_000L;
+
+    /** How long (ms) a completed {@link PrepInFlight} entry stays in the map
+     *  before being considered stale and discarded. */
+    private static final long INFLIGHT_EXPIRY_MS = 10 * 60 * 1000L; // 10 min
+
+    /**
+     * Live state of a background pre-launch preparation job keyed by the same
+     * {@code project\u0000applicationId} string as {@link #KEY_LOCKS}.
+     *
+     * <p>A tool thread that starts the prep job sets {@code startedAtMs} and adds
+     * this entry to {@link #PREP_INFLIGHT}. The background job updates
+     * {@link #phase} as it progresses and sets {@link #done} (or {@link #error})
+     * when it finishes. A concurrent tool call picks up the existing entry and
+     * waits on {@link #latch} instead of starting a second job.
+     *
+     * <p>Instances are published safely: the tool thread writes all fields before
+     * putting the entry in the map; subsequent readers see a fully initialised
+     * object. Volatile fields ({@code phase}, {@code done}, {@code error}) are
+     * visible across threads without additional synchronisation.
+     */
+    public static final class PrepInFlight
+    {
+        /** Human-readable phase label set by the background job. */
+        public volatile String phase = "recompute"; //$NON-NLS-1$
+        /** Wall-clock time the job started (used to compute elapsed seconds). */
+        public final long startedAtMs;
+        /** Set to {@code true} by the background job when preparation completed. */
+        public volatile boolean done = false;
+        /** Non-null when preparation ended in a failure; the caller surfaces it. */
+        public volatile String error = null;
+        /** Latch the background job counts down when done (or on error). */
+        public final CountDownLatch latch = new CountDownLatch(1);
+        /**
+         * Guards single-Job creation. Only the thread that wins
+         * {@code started.compareAndSet(false, true)} constructs and schedules
+         * the background Job; every other concurrent thread that obtained this
+         * same entry via {@code computeIfAbsent} simply awaits {@link #latch}.
+         *
+         * <p>Public solely for access from the background Job lambda inside
+         * {@code RunYaxunitTestsTool} — not part of the general API.
+         */
+        public final AtomicBoolean started = new AtomicBoolean(false);
+
+        public PrepInFlight(long startedAtMs)
+        {
+            this.startedAtMs = startedAtMs;
+        }
+
+        /** Elapsed whole seconds since the job started. */
+        public long elapsedSeconds()
+        {
+            return (System.currentTimeMillis() - startedAtMs) / 1000L;
+        }
+
+        /** {@code true} when the entry is older than {@link #INFLIGHT_EXPIRY_MS}. */
+        public boolean isExpired()
+        {
+            return System.currentTimeMillis() - startedAtMs > INFLIGHT_EXPIRY_MS;
+        }
+    }
+
+    /**
+     * In-flight preparation map. Keyed by {@code project\u0000applicationId}
+     * (the same string as {@link #KEY_LOCKS}).
+     *
+     * <p>Entries are created via {@link ConcurrentMap#computeIfAbsent}; the
+     * thread that wins the {@link PrepInFlight#started} CAS schedules the
+     * background Job while every other concurrent thread awaits
+     * {@link PrepInFlight#latch} on the same entry. Entries for completed,
+     * error'd, or timed-out preps expire after {@link #INFLIGHT_EXPIRY_MS} and
+     * are replaced atomically on the next access for the same key.
+     *
+     * <p>Public solely for access from the background Job lambda inside
+     * {@code RunYaxunitTestsTool} — not part of the general API.
+     */
+    public static final ConcurrentMap<String, PrepInFlight> PREP_INFLIGHT = new ConcurrentHashMap<>();
+
+    /**
+     * Returns (or creates) a preparation lock key identical in format to
+     * {@link #lockFor(String, String)} but returned as a {@code String} so it can
+     * be used both as a map key and as the argument to
+     * {@code lockFor(projectName, applicationId)}.
+     */
+    public static String prepKeyFor(String projectName, String applicationId)
+    {
+        return (projectName != null ? projectName : "") //$NON-NLS-1$
+            + '\u0000' + (applicationId != null ? applicationId : ""); //$NON-NLS-1$ //$NON-NLS-2$
+    }
 
     /** Production default for {@link #syncSettleWindowMs}: 5 seconds. */
     static final long DEFAULT_SYNC_SETTLE_WINDOW_MS = 5000L;
@@ -538,6 +641,123 @@ public final class LaunchLifecycleUtils
             }
             BuildUtils.waitForDerivedData(project);
         }
+    }
+
+    /**
+     * Selective variant of {@link #recomputeAndSettle}: consults
+     * {@link PreLaunchChangeTracker} to partition {@code projects} into dirty and
+     * clean subsets, then applies the expensive {@code recomputeAll()} only to
+     * dirty projects while giving clean projects the cheap
+     * {@link BuildUtils#waitForDerivedData} pass only.
+     *
+     * <p>This is the fix for the performance regression: on a large configuration,
+     * unconditional {@code recomputeAll()} for every project on every
+     * {@code run_yaxunit_tests} call costs 2–8 minutes. After a successful prepare,
+     * projects are marked clean — no recompute until a file change is detected.
+     * The stale-{@code .cfe} safety guarantee is preserved: a project is dirty on
+     * the first call after plugin start, and again whenever the workspace listener
+     * observes a non-derived file change in that project.
+     *
+     * <h3>Ordering-race fix</h3>
+     * <p>The dirty snapshot ({@link PreLaunchChangeTracker#snapshotDirty}) is taken
+     * BEFORE the recompute begins and returned to the caller. The caller passes it to
+     * {@link PreLaunchChangeTracker#markPrepared(Collection, Map)} only on success
+     * paths, so a file change that arrives DURING the recompute increments the
+     * generation counter in {@link PreLaunchChangeTracker#DIRTY} to a value higher
+     * than the snapshot; the subsequent conditional remove in {@code markPrepared}
+     * fails and the project remains dirty for the next launch.
+     *
+     * <p>This method does NOT call {@code markPrepared} itself — that is the
+     * caller's ({@link #prepareForFreshLaunch}) responsibility, and only on the
+     * success returns.
+     *
+     * <p>Sequence:
+     * <ol>
+     *   <li>Take the dirty snapshot (generation-keyed) BEFORE scheduling any
+     *       recompute.</li>
+     *   <li>Partition scope: dirty (per {@link PreLaunchChangeTracker#isDirty}) vs.
+     *       clean.</li>
+     *   <li>Dirty projects: {@link #recomputeAndSettle(Collection)} — full
+     *       forced recompute + workspace build drain + per-project derived-data
+     *       wait.</li>
+     *   <li>Clean projects: {@link BuildUtils#waitForDerivedData} only (returns
+     *       immediately when nothing is pending — the pre-regression fast path).
+     *       No {@code waitForBuildJobs} here: the workspace build was already
+     *       drained by the dirty-project phase (or by EDT's own incremental builds
+     *       if there were no dirty projects at all, in which case nothing pending
+     *       means nothing to wait on).</li>
+     * </ol>
+     *
+     * <p>The log lines produced by this method ("Pre-launch: N project(s) changed
+     * since last prepared launch → forced recompute: [names]; M unchanged →
+     * skipped" or "all N project(s) up-to-date — skipping recompute") are the
+     * primary evidence that the optimisation is in effect.
+     *
+     * @param projects scope after {@link #resolveUpdateScope} has been applied
+     *            (may be {@code null} or empty — returns empty snapshot)
+     * @return the dirty snapshot taken before the recompute; pass it to
+     *         {@link PreLaunchChangeTracker#markPrepared(Collection, Map)} on the
+     *         success path (the caller, not this method, is responsible for that
+     *         call so {@code markPrepared} is only invoked on genuine successes)
+     */
+    public static Map<String, Long> recomputeAndSettleIfDirty(Collection<IProject> projects)
+    {
+        // Take the snapshot BEFORE the recompute so any change arriving during
+        // the recompute stores a HIGHER generation in DIRTY; markPrepared's
+        // conditional remove will then leave that entry in place.
+        Map<String, Long> snapshot = PreLaunchChangeTracker.snapshotDirty(projects);
+
+        if (projects == null || projects.isEmpty())
+        {
+            return snapshot;
+        }
+
+        List<IProject> dirty = new ArrayList<>();
+        List<IProject> clean = new ArrayList<>();
+        for (IProject project : projects)
+        {
+            if (project == null || !project.exists() || !project.isOpen())
+            {
+                continue;
+            }
+            if (PreLaunchChangeTracker.isDirty(project))
+            {
+                dirty.add(project);
+            }
+            else
+            {
+                clean.add(project);
+            }
+        }
+
+        if (!dirty.isEmpty())
+        {
+            String dirtyNames = dirty.stream().map(IProject::getName)
+                .collect(Collectors.joining(", ")); //$NON-NLS-1$
+            Activator.logInfo("Pre-launch: " + dirty.size() //$NON-NLS-1$
+                + " project(s) changed since last prepared launch -> forced recompute: [" //$NON-NLS-1$
+                + dirtyNames + "]; " + clean.size() + " unchanged -> skipped"); //$NON-NLS-1$ //$NON-NLS-2$
+            // Full recompute+settle for the dirty subset.
+            recomputeAndSettle(dirty);
+        }
+        else
+        {
+            Activator.logInfo("Pre-launch: all " + projects.size() //$NON-NLS-1$
+                + " project(s) up-to-date — skipping recompute"); //$NON-NLS-1$
+        }
+
+        // Cheap derived-data drain for clean projects (no recomputeAll, returns
+        // immediately when nothing pending — the pre-regression fast path).
+        for (IProject project : clean)
+        {
+            BuildUtils.waitForDerivedData(project);
+        }
+
+        // NOTE: markPrepared is intentionally NOT called here. The caller
+        // (prepareForFreshLaunch) calls PreLaunchChangeTracker.markPrepared(all, snapshot)
+        // only on the success paths so that a failed or aborted prepare never
+        // marks projects as clean.
+        return snapshot;
     }
 
     /**
@@ -1438,15 +1658,23 @@ public final class LaunchLifecycleUtils
                 terminated++;
             }
 
-            // FORCE a derived-data recompute of the launch project AND the
-            // requested extensions BEFORE the update runs, then wait for it to
-            // settle. Without the forced recompute, an extension (.cfe) edited
-            // just before the launch is never regenerated (the derived-data wait
-            // no-ops when nothing is scheduled) and appManager.update() consumes
-            // the stale export artifact — so the first test run executes the old
-            // extension, missing freshly added tests. updateScope
-            // narrows the recompute when only a specific extension changed.
-            recomputeAndSettle(resolveUpdateScope(project, updateScope));
+            // Selectively force a derived-data recompute of projects that have
+            // had file changes since the last successful prepare (dirty projects).
+            // Clean projects get only a cheap derived-data drain. Without the
+            // forced recompute for dirty projects, an extension (.cfe) edited just
+            // before the launch is never regenerated (the derived-data wait no-ops
+            // when nothing is scheduled) and appManager.update() consumes the
+            // stale export artifact — so the first test run executes the old
+            // extension, missing freshly added tests. updateScope narrows the
+            // project scope FIRST; the dirty filter is applied within that scope.
+            //
+            // The snapshot is taken INSIDE recomputeAndSettleIfDirty, BEFORE the
+            // recompute begins. We receive it back so we can pass it to
+            // markPrepared on the success paths — a change arriving DURING the
+            // recompute bumps the generation counter; the conditional remove in
+            // markPrepared then fails and the project stays dirty (stale-.cfe fix).
+            List<IProject> scopeProjects = resolveUpdateScope(project, updateScope);
+            Map<String, Long> dirtySnapshot = recomputeAndSettleIfDirty(scopeProjects);
 
             // A STANDALONE-SERVER application (literal
             // "ServerApplication." id prefix) must NOT be DB-updated out-of-band
@@ -1469,6 +1697,10 @@ public final class LaunchLifecycleUtils
                 Activator.logInfo("Pre-launch auto-chain: server application: deferring DB update " //$NON-NLS-1$
                     + "to the launch delegate's coordinated path (auto-confirmed): applicationId=" //$NON-NLS-1$
                     + applicationId);
+                // Success path: mark all scope projects as prepared with the
+                // generation-keyed snapshot so the next call skips the recompute
+                // when nothing changed (and keeps dirty flag on a change-during-recompute).
+                PreLaunchChangeTracker.markPrepared(scopeProjects, dirtySnapshot);
                 return new PreLaunchResult(true, terminated, null);
             }
 
@@ -1485,8 +1717,11 @@ public final class LaunchLifecycleUtils
                 appManager, true);
             if (updateErr.isPresent())
             {
+                // Error path: do NOT mark prepared — the next call must recompute.
                 return new PreLaunchResult(false, terminated, updateErr.get());
             }
+            // Success path: mark prepared with the generation-keyed snapshot.
+            PreLaunchChangeTracker.markPrepared(scopeProjects, dirtySnapshot);
             return new PreLaunchResult(true, terminated, null);
         }
     }
