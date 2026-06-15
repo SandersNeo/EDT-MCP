@@ -6,7 +6,6 @@
 
 package com.ditrix.edt.mcp.server.tools.impl;
 
-import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -16,11 +15,12 @@ import java.util.Map;
 import com.ditrix.edt.mcp.server.Activator;
 import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
 import com.ditrix.edt.mcp.server.protocol.JsonUtils;
+import com.ditrix.edt.mcp.server.protocol.McpKeys;
 import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
+import com.ditrix.edt.mcp.server.utils.CliReflectionErrors;
 import com.ditrix.edt.mcp.server.utils.FrontMatter;
-
-import org.eclipse.core.resources.ResourcesPlugin;
+import com.ditrix.edt.mcp.server.utils.WorkspacePaths;
 
 /**
  * Tool that wraps the EDT "Export → Configuration to XML Files" action.
@@ -38,6 +38,9 @@ import org.eclipse.core.resources.ResourcesPlugin;
 public class ExportConfigurationToXmlTool implements IMcpTool
 {
     public static final String NAME = "export_configuration_to_xml"; //$NON-NLS-1$
+
+    /** Input param: filesystem path of the output directory for the XML files. */
+    private static final String KEY_OUTPUT_PATH = "outputPath"; //$NON-NLS-1$
 
     @Override
     public String getName()
@@ -57,8 +60,8 @@ public class ExportConfigurationToXmlTool implements IMcpTool
     public String getInputSchema()
     {
         return JsonSchemaBuilder.object()
-            .stringProperty("projectName", "EDT project name to export (required)", true) //$NON-NLS-1$ //$NON-NLS-2$
-            .stringProperty("outputPath", //$NON-NLS-1$
+            .stringProperty(McpKeys.PROJECT_NAME, "EDT project name to export (required)", true) //$NON-NLS-1$
+            .stringProperty(KEY_OUTPUT_PATH,
                 "Filesystem path of the output directory for the XML files (required)", true) //$NON-NLS-1$
             .build();
     }
@@ -72,10 +75,10 @@ public class ExportConfigurationToXmlTool implements IMcpTool
     @Override
     public String execute(Map<String, String> params)
     {
-        String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
-        String outputPathStr = JsonUtils.extractStringArgument(params, "outputPath"); //$NON-NLS-1$
+        String projectName = JsonUtils.extractStringArgument(params, McpKeys.PROJECT_NAME);
+        String outputPathStr = JsonUtils.extractStringArgument(params, KEY_OUTPUT_PATH);
 
-        String err = JsonUtils.requireArguments(params, "projectName", "outputPath"); //$NON-NLS-1$ //$NON-NLS-2$
+        String err = JsonUtils.requireArguments(params, McpKeys.PROJECT_NAME, KEY_OUTPUT_PATH);
         if (err != null)
         {
             return err;
@@ -101,7 +104,7 @@ public class ExportConfigurationToXmlTool implements IMcpTool
             // still flag writes outside the workspace so an injected/erroneous call
             // is visible. Non-breaking: warn, do not reject (local export to an
             // external dir is a legitimate action).
-            boolean outsideWorkspace = isOutsideWorkspace(outputPath);
+            boolean outsideWorkspace = WorkspacePaths.isOutsideWorkspace(outputPath);
             if (outsideWorkspace)
             {
                 Activator.logWarning("export_configuration_to_xml: outputPath is OUTSIDE the EDT workspace: " //$NON-NLS-1$
@@ -128,8 +131,8 @@ public class ExportConfigurationToXmlTool implements IMcpTool
             FrontMatter fm = FrontMatter.create()
                 .put("tool", NAME) //$NON-NLS-1$
                 .put("status", "success") //$NON-NLS-1$ //$NON-NLS-2$
-                .put("project", projectName) //$NON-NLS-1$
-                .put("outputPath", outputPath.toString()); //$NON-NLS-1$
+                .put(McpKeys.PROJECT, projectName)
+                .put(KEY_OUTPUT_PATH, outputPath.toString());
             if (outsideWorkspace)
             {
                 fm.put("outsideWorkspace", true); //$NON-NLS-1$
@@ -148,46 +151,9 @@ public class ExportConfigurationToXmlTool implements IMcpTool
 
             return fm.wrapContent(body.toString());
         }
-        catch (InvocationTargetException e)
-        {
-            Throwable cause = e.getCause() != null ? e.getCause() : e;
-            Activator.logError("export_configuration_to_xml failed", cause); //$NON-NLS-1$
-            return ToolResult.error("Export failed: " + cause.getMessage()).toJson(); //$NON-NLS-1$
-        }
-        catch (NoSuchMethodException | IllegalAccessException e)
-        {
-            Activator.logError("CLI API mismatch", e); //$NON-NLS-1$
-            return ToolResult.error("CLI API mismatch: " + e.getMessage()).toJson(); //$NON-NLS-1$
-        }
         catch (Exception e)
         {
-            Activator.logError("Unexpected error in export_configuration_to_xml", e); //$NON-NLS-1$
-            return ToolResult.error(e.getMessage()).toJson();
-        }
-    }
-
-    /**
-     * Returns true if {@code path} is not under the Eclipse workspace root.
-     * Used to flag (not block) configuration exports to external locations.
-     * Deliberately fails OPEN (returns false on any uncertainty): this is an
-     * advisory-only check, so a false negative merely omits a warning and never
-     * rejects a legitimate export.
-     */
-    private static boolean isOutsideWorkspace(Path path)
-    {
-        try
-        {
-            org.eclipse.core.runtime.IPath loc = ResourcesPlugin.getWorkspace().getRoot().getLocation();
-            if (loc == null)
-            {
-                return false;
-            }
-            Path wsRoot = loc.toFile().toPath().toAbsolutePath().normalize();
-            return !path.startsWith(wsRoot);
-        }
-        catch (Exception e)
-        {
-            return false; // cannot determine — do not flag
+            return CliReflectionErrors.toErrorJson(e, "Export", "CLI"); //$NON-NLS-1$ //$NON-NLS-2$
         }
     }
 }

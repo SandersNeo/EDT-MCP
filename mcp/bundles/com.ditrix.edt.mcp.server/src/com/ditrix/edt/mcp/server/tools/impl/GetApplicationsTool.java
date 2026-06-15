@@ -14,9 +14,10 @@ import org.eclipse.core.resources.IProject;
 import com.ditrix.edt.mcp.server.Activator;
 import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
 import com.ditrix.edt.mcp.server.protocol.JsonUtils;
+import com.ditrix.edt.mcp.server.protocol.McpKeys;
 import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
-import com.ditrix.edt.mcp.server.utils.ProjectContext;
+import com.ditrix.edt.mcp.server.utils.ApplicationSupport;
 import com.ditrix.edt.mcp.server.utils.ProjectStateChecker;
 import com.e1c.g5.dt.applications.ApplicationException;
 import com.e1c.g5.dt.applications.ApplicationUpdateState;
@@ -32,7 +33,13 @@ import com.google.gson.JsonObject;
 public class GetApplicationsTool implements IMcpTool
 {
     public static final String NAME = "get_applications"; //$NON-NLS-1$
-    
+
+    /** Output key: array of applications (infobases) for the project. */
+    private static final String KEY_APPLICATIONS = "applications"; //$NON-NLS-1$
+
+    /** Output key: number of applications found. */
+    private static final String KEY_COUNT = "count"; //$NON-NLS-1$
+
     @Override
     public String getName()
     {
@@ -51,7 +58,7 @@ public class GetApplicationsTool implements IMcpTool
     public String getInputSchema()
     {
         return JsonSchemaBuilder.object()
-            .stringProperty("projectName", "EDT project name (required)", true) //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty(McpKeys.PROJECT_NAME, "EDT project name (required)", true) //$NON-NLS-1$
             .build();
     }
 
@@ -60,9 +67,9 @@ public class GetApplicationsTool implements IMcpTool
     {
         return JsonSchemaBuilder.object()
             .booleanProperty("success", "Whether the operation succeeded", true) //$NON-NLS-1$ //$NON-NLS-2$
-            .stringProperty("project", "EDT project name the applications belong to") //$NON-NLS-1$ //$NON-NLS-2$
-            .objectArrayProperty("applications", "Applications with id, name, type and update state") //$NON-NLS-1$ //$NON-NLS-2$
-            .integerProperty("count", "Number of applications found") //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty(McpKeys.PROJECT, "EDT project name the applications belong to") //$NON-NLS-1$
+            .objectArrayProperty(KEY_APPLICATIONS, "Applications with id, name, type and update state") //$NON-NLS-1$
+            .integerProperty(KEY_COUNT, "Number of applications found") //$NON-NLS-1$
             .stringProperty("message", "Informational message when no applications are found") //$NON-NLS-1$ //$NON-NLS-2$
             .stringProperty("defaultApplicationId", "Id of the project's default application") //$NON-NLS-1$ //$NON-NLS-2$
             .build();
@@ -77,10 +84,10 @@ public class GetApplicationsTool implements IMcpTool
     @Override
     public String execute(Map<String, String> params)
     {
-        String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
+        String projectName = JsonUtils.extractStringArgument(params, McpKeys.PROJECT_NAME);
 
         // Validate project name
-        String err = JsonUtils.requireArgument(params, "projectName"); //$NON-NLS-1$
+        String err = JsonUtils.requireArgument(params, McpKeys.PROJECT_NAME);
         if (err != null)
         {
             return err;
@@ -107,26 +114,13 @@ public class GetApplicationsTool implements IMcpTool
     {
         try
         {
-            ProjectContext ctx = ProjectContext.of(projectName);
-
-            if (!ctx.exists())
+            ApplicationSupport.ManagerResult mr = ApplicationSupport.resolveManager(projectName);
+            if (!mr.ok())
             {
-                return ToolResult.error(ProjectContext.notFoundMessage(projectName)).toJson();
+                return mr.errorJson();
             }
-
-            if (!ctx.isOpen())
-            {
-                return ToolResult.error("Project is closed: " + projectName).toJson(); //$NON-NLS-1$
-            }
-
-            IProject project = ctx.project();
-            
-            // Get application manager
-            IApplicationManager appManager = Activator.getDefault().getApplicationManager();
-            if (appManager == null)
-            {
-                return ToolResult.error("IApplicationManager service is not available").toJson(); //$NON-NLS-1$
-            }
+            IProject project = mr.project();
+            IApplicationManager appManager = mr.manager();
             
             // Get applications for the project
             List<IApplication> applications = appManager.getApplications(project);
@@ -134,9 +128,9 @@ public class GetApplicationsTool implements IMcpTool
             if (applications == null || applications.isEmpty())
             {
                 return ToolResult.success()
-                    .put("project", projectName) //$NON-NLS-1$
-                    .put("applications", new JsonArray()) //$NON-NLS-1$
-                    .put("count", 0) //$NON-NLS-1$
+                    .put(McpKeys.PROJECT, projectName)
+                    .put(KEY_APPLICATIONS, new JsonArray())
+                    .put(KEY_COUNT, 0)
                     .put("message", "No applications found for project") //$NON-NLS-1$ //$NON-NLS-2$
                     .toJson();
             }
@@ -198,9 +192,9 @@ public class GetApplicationsTool implements IMcpTool
             }
             
             ToolResult result = ToolResult.success()
-                .put("project", projectName) //$NON-NLS-1$
-                .put("applications", appsArray) //$NON-NLS-1$
-                .put("count", applications.size()); //$NON-NLS-1$
+                .put(McpKeys.PROJECT, projectName)
+                .put(KEY_APPLICATIONS, appsArray)
+                .put(KEY_COUNT, applications.size());
             
             if (defaultAppId != null)
             {

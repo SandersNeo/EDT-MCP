@@ -6,7 +6,6 @@
 
 package com.ditrix.edt.mcp.server.tools.impl;
 
-import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.List;
 import java.util.Map;
@@ -18,9 +17,11 @@ import com._1c.g5.v8.dt.core.platform.IDtProjectManager;
 import com.ditrix.edt.mcp.server.Activator;
 import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
 import com.ditrix.edt.mcp.server.protocol.JsonUtils;
+import com.ditrix.edt.mcp.server.protocol.McpKeys;
 import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
 import com.ditrix.edt.mcp.server.utils.BuildUtils;
+import com.ditrix.edt.mcp.server.utils.CliReflectionErrors;
 import com.ditrix.edt.mcp.server.utils.FrontMatter;
 import com.ditrix.edt.mcp.server.utils.ProjectContext;
 import com.ditrix.edt.mcp.server.utils.ProjectStateChecker;
@@ -74,7 +75,7 @@ public class TranslateConfigurationTool implements IMcpTool
     public String getInputSchema()
     {
         return JsonSchemaBuilder.object()
-            .stringProperty("projectName", "Project name (typically the source, e.g. the ru project). Required.", true) //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty(McpKeys.PROJECT_NAME, "Project name (typically the source, e.g. the ru project). Required.", true) //$NON-NLS-1$
             .stringArrayProperty("targetLanguages", //$NON-NLS-1$
                 "Target language codes to synchronize (e.g. [\"en\"]). Required.", true) //$NON-NLS-1$
             .build();
@@ -89,10 +90,10 @@ public class TranslateConfigurationTool implements IMcpTool
     @Override
     public String execute(Map<String, String> params)
     {
-        String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
+        String projectName = JsonUtils.extractStringArgument(params, McpKeys.PROJECT_NAME);
         List<String> targetLanguages = JsonUtils.extractArrayArgument(params, "targetLanguages"); //$NON-NLS-1$
 
-        String err = JsonUtils.requireArgument(params, "projectName"); //$NON-NLS-1$
+        String err = JsonUtils.requireArgument(params, McpKeys.PROJECT_NAME);
         if (err != null)
         {
             return err;
@@ -151,28 +152,14 @@ public class TranslateConfigurationTool implements IMcpTool
 
             return FrontMatter.create()
                 .put("tool", NAME) //$NON-NLS-1$
-                .put("project", projectName) //$NON-NLS-1$
+                .put(McpKeys.PROJECT, projectName)
                 .put("targetLanguages", String.join(", ", targetLanguages)) //$NON-NLS-1$ //$NON-NLS-2$
                 .put("status", "success") //$NON-NLS-1$ //$NON-NLS-2$
                 .wrapContent("Translate configuration completed."); //$NON-NLS-1$
         }
-        catch (InvocationTargetException e)
-        {
-            // Unwrap the real exception thrown by the LanguageTool API
-            // (typically com.e1c.langtool.v8.dt.cli.api.TranslationCliApiException).
-            Throwable cause = e.getCause() != null ? e.getCause() : e;
-            Activator.logError("Translate configuration failed", cause); //$NON-NLS-1$
-            return ToolResult.error("Translate configuration failed: " + cause.getMessage()).toJson(); //$NON-NLS-1$
-        }
-        catch (NoSuchMethodException | IllegalAccessException e)
-        {
-            Activator.logError("LanguageTool API mismatch (method signature changed?)", e); //$NON-NLS-1$
-            return ToolResult.error("LanguageTool API mismatch: " + e.getMessage()).toJson(); //$NON-NLS-1$
-        }
         catch (Exception e)
         {
-            Activator.logError("Unexpected error running Translate configuration", e); //$NON-NLS-1$
-            return ToolResult.error(e.getMessage()).toJson();
+            return CliReflectionErrors.toErrorJson(e, "Translate configuration", "LanguageTool"); //$NON-NLS-1$ //$NON-NLS-2$
         }
     }
 }

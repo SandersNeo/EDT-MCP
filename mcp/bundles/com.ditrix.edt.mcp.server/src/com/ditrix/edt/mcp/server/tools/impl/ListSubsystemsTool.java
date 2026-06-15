@@ -11,18 +11,17 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
-import org.eclipse.core.resources.IProject;
 import org.eclipse.emf.common.util.EMap;
 import org.eclipse.swt.widgets.Display;
 import org.eclipse.ui.PlatformUI;
 
-import com._1c.g5.v8.dt.core.platform.IConfigurationProvider;
 import com._1c.g5.v8.dt.metadata.mdclass.Configuration;
 import com._1c.g5.v8.dt.metadata.mdclass.Subsystem;
 import com.ditrix.edt.mcp.server.Activator;
 import com.ditrix.edt.mcp.server.preferences.ToolParameterSettings;
 import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
 import com.ditrix.edt.mcp.server.protocol.JsonUtils;
+import com.ditrix.edt.mcp.server.protocol.McpKeys;
 import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
 import com.ditrix.edt.mcp.server.utils.MarkdownUtils;
@@ -58,13 +57,13 @@ public class ListSubsystemsTool implements IMcpTool
     public String getInputSchema()
     {
         return JsonSchemaBuilder.object()
-            .stringProperty("projectName", //$NON-NLS-1$
+            .stringProperty(McpKeys.PROJECT_NAME,
                 "EDT project name (required)", true) //$NON-NLS-1$
             .stringProperty("nameFilter", //$NON-NLS-1$
                 "Case-insensitive partial match on Name only (not Synonym)") //$NON-NLS-1$
             .booleanProperty("recursive", //$NON-NLS-1$
                 "Include nested subsystems (default: true)") //$NON-NLS-1$
-            .integerProperty("limit", //$NON-NLS-1$
+            .integerProperty(McpKeys.LIMIT,
                 "Max results (default from preferences: 100, max 1000)") //$NON-NLS-1$
             .stringProperty("language", //$NON-NLS-1$
                 "Synonym language code, e.g. 'en'/'ru' (default: configuration default)") //$NON-NLS-1$
@@ -80,7 +79,7 @@ public class ListSubsystemsTool implements IMcpTool
     @Override
     public String getResultFileName(Map<String, String> params)
     {
-        String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
+        String projectName = JsonUtils.extractStringArgument(params, McpKeys.PROJECT_NAME);
         if (projectName != null && !projectName.isEmpty())
         {
             return "subsystems-" + projectName.toLowerCase() + ".md"; //$NON-NLS-1$ //$NON-NLS-2$
@@ -91,21 +90,21 @@ public class ListSubsystemsTool implements IMcpTool
     @Override
     public String execute(Map<String, String> params)
     {
-        String err = JsonUtils.requireArgument(params, "projectName"); //$NON-NLS-1$
+        String err = JsonUtils.requireArgument(params, McpKeys.PROJECT_NAME);
         if (err != null)
         {
             return err;
         }
 
-        String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
+        String projectName = JsonUtils.extractStringArgument(params, McpKeys.PROJECT_NAME);
         String nameFilter = JsonUtils.extractStringArgument(params, "nameFilter"); //$NON-NLS-1$
         String language = JsonUtils.extractStringArgument(params, "language"); //$NON-NLS-1$
 
         boolean recursive = JsonUtils.extractBooleanArgument(params, "recursive", true); //$NON-NLS-1$
 
         int defaultLimit = ToolParameterSettings.getInstance()
-            .getParameterValue(NAME, "limit", 100); //$NON-NLS-1$
-        int limit = JsonUtils.extractIntArgument(params, "limit", defaultLimit); //$NON-NLS-1$
+            .getParameterValue(NAME, McpKeys.LIMIT, 100);
+        int limit = JsonUtils.extractIntArgument(params, McpKeys.LIMIT, defaultLimit);
         limit = Pagination.clampLimit(limit, 1000);
 
         AtomicReference<String> resultRef = new AtomicReference<>();
@@ -133,24 +132,12 @@ public class ListSubsystemsTool implements IMcpTool
     private String listSubsystemsInternal(String projectName, String nameFilter,
         boolean recursive, int limit, String language)
     {
-        ProjectContext ctx = ProjectContext.of(projectName);
-        if (!ctx.exists())
+        ProjectContext.ConfigurationResult resolved = ProjectContext.resolveConfiguration(projectName);
+        if (!resolved.ok())
         {
-            return ToolResult.error(ProjectContext.notFoundMessage(projectName)).toJson();
+            return resolved.errorJson();
         }
-        IProject project = ctx.project();
-
-        IConfigurationProvider configProvider = Activator.getDefault().getConfigurationProvider();
-        if (configProvider == null)
-        {
-            return ToolResult.error("Configuration provider not available").toJson(); //$NON-NLS-1$
-        }
-
-        Configuration config = configProvider.getConfiguration(project);
-        if (config == null)
-        {
-            return ToolResult.error("Could not get configuration for project: " + projectName).toJson(); //$NON-NLS-1$
-        }
+        Configuration config = resolved.configuration();
 
         String effectiveLanguage = SubsystemUtils.resolveLanguage(language, config);
 

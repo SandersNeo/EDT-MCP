@@ -17,7 +17,6 @@ import org.eclipse.swt.widgets.Display;
 import org.eclipse.ui.PlatformUI;
 
 import com._1c.g5.v8.dt.bsl.model.Module;
-import com._1c.g5.v8.dt.core.platform.IConfigurationProvider;
 import com._1c.g5.v8.dt.metadata.mdclass.AccumulationRegister;
 import com._1c.g5.v8.dt.metadata.mdclass.BusinessProcess;
 import com._1c.g5.v8.dt.metadata.mdclass.Catalog;
@@ -39,6 +38,7 @@ import com.ditrix.edt.mcp.server.Activator;
 import com.ditrix.edt.mcp.server.preferences.ToolParameterSettings;
 import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
 import com.ditrix.edt.mcp.server.protocol.JsonUtils;
+import com.ditrix.edt.mcp.server.protocol.McpKeys;
 import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
 import com.ditrix.edt.mcp.server.utils.ExtensionOriginUtils;
@@ -93,7 +93,7 @@ public class GetMetadataObjectsTool implements IMcpTool
     public String getInputSchema()
     {
         return JsonSchemaBuilder.object()
-            .stringProperty("projectName", //$NON-NLS-1$
+            .stringProperty(McpKeys.PROJECT_NAME,
                 "EDT project name (required)", true) //$NON-NLS-1$
             .stringProperty("metadataType", //$NON-NLS-1$
                 "Type filter (case-insensitive), default 'all'. One of: all, documents, catalogs, " + //$NON-NLS-1$
@@ -118,7 +118,7 @@ public class GetMetadataObjectsTool implements IMcpTool
     @Override
     public String getResultFileName(Map<String, String> params)
     {
-        String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
+        String projectName = JsonUtils.extractStringArgument(params, McpKeys.PROJECT_NAME);
         if (projectName != null && !projectName.isEmpty())
         {
             return "metadata-" + projectName.toLowerCase() + ".md"; //$NON-NLS-1$ //$NON-NLS-2$
@@ -129,13 +129,13 @@ public class GetMetadataObjectsTool implements IMcpTool
     @Override
     public String execute(Map<String, String> params)
     {
-        String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
+        String projectName = JsonUtils.extractStringArgument(params, McpKeys.PROJECT_NAME);
         String metadataType = JsonUtils.extractStringArgument(params, "metadataType"); //$NON-NLS-1$
         String nameFilter = JsonUtils.extractStringArgument(params, "nameFilter"); //$NON-NLS-1$
         String language = JsonUtils.extractStringArgument(params, "language"); //$NON-NLS-1$
 
         // Validate required parameter
-        String err = JsonUtils.requireArgument(params, "projectName"); //$NON-NLS-1$
+        String err = JsonUtils.requireArgument(params, McpKeys.PROJECT_NAME);
         if (err != null)
         {
             return err;
@@ -183,27 +183,15 @@ public class GetMetadataObjectsTool implements IMcpTool
     private String getMetadataObjectsInternal(String projectName, String metadataType,
                                                String nameFilter, int limit, String language)
     {
-        // Get project
-        ProjectContext ctx = ProjectContext.of(projectName);
-        if (!ctx.exists())
+        // Resolve the project and its configuration
+        ProjectContext.ConfigurationResult resolved = ProjectContext.resolveConfiguration(projectName);
+        if (!resolved.ok())
         {
-            return ToolResult.error(ProjectContext.notFoundMessage(projectName)).toJson();
+            return resolved.errorJson();
         }
-        IProject project = ctx.project();
-        
-        // Get configuration
-        IConfigurationProvider configProvider = Activator.getDefault().getConfigurationProvider();
-        if (configProvider == null)
-        {
-            return ToolResult.error("Configuration provider not available").toJson(); //$NON-NLS-1$
-        }
-        
-        Configuration config = configProvider.getConfiguration(project);
-        if (config == null)
-        {
-            return ToolResult.error("Could not get configuration for project: " + projectName).toJson(); //$NON-NLS-1$
-        }
-        
+        IProject project = resolved.project();
+        Configuration config = resolved.configuration();
+
         // Determine language CODE for synonyms (the synonym map is keyed by code,
         // e.g. "ru"/"en", not by the Language object's name). May be null when the
         // configuration has no languages; getSynonymForLanguage tolerates that.

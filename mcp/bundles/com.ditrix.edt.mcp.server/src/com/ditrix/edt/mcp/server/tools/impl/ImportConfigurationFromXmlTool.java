@@ -6,7 +6,6 @@
 
 package com.ditrix.edt.mcp.server.tools.impl;
 
-import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -22,9 +21,12 @@ import org.eclipse.core.runtime.NullProgressMonitor;
 import com.ditrix.edt.mcp.server.Activator;
 import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
 import com.ditrix.edt.mcp.server.protocol.JsonUtils;
+import com.ditrix.edt.mcp.server.protocol.McpKeys;
 import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
+import com.ditrix.edt.mcp.server.utils.CliReflectionErrors;
 import com.ditrix.edt.mcp.server.utils.FrontMatter;
+import com.ditrix.edt.mcp.server.utils.WorkspacePaths;
 
 /**
  * Tool that wraps the EDT "Import → Configuration from XML Files" action.
@@ -40,6 +42,9 @@ import com.ditrix.edt.mcp.server.utils.FrontMatter;
 public class ImportConfigurationFromXmlTool implements IMcpTool
 {
     public static final String NAME = "import_configuration_from_xml"; //$NON-NLS-1$
+
+    /** Input param: path of the source directory of XML files. */
+    private static final String KEY_IMPORT_PATH = "importPath"; //$NON-NLS-1$
 
     @Override
     public String getName()
@@ -60,9 +65,9 @@ public class ImportConfigurationFromXmlTool implements IMcpTool
     public String getInputSchema()
     {
         return JsonSchemaBuilder.object()
-            .stringProperty("importPath", //$NON-NLS-1$
+            .stringProperty(KEY_IMPORT_PATH,
                 "Path of the source directory of XML files.", true) //$NON-NLS-1$
-            .stringProperty("projectName", //$NON-NLS-1$
+            .stringProperty(McpKeys.PROJECT_NAME,
                 "Name of the NEW EDT project to create (must not already exist).", true) //$NON-NLS-1$
             .stringProperty("projectNature", //$NON-NLS-1$
                 "Optional EDT nature ID, e.g. 'com._1c.g5.v8.dt.core.V8ConfigurationNature'; empty = auto-detect.") //$NON-NLS-1$
@@ -80,14 +85,14 @@ public class ImportConfigurationFromXmlTool implements IMcpTool
     @Override
     public String execute(Map<String, String> params)
     {
-        String err = JsonUtils.requireArguments(params, "importPath", "projectName"); //$NON-NLS-1$ //$NON-NLS-2$
+        String err = JsonUtils.requireArguments(params, KEY_IMPORT_PATH, McpKeys.PROJECT_NAME);
         if (err != null)
         {
             return err;
         }
 
-        String importPathStr = JsonUtils.extractStringArgument(params, "importPath"); //$NON-NLS-1$
-        String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
+        String importPathStr = JsonUtils.extractStringArgument(params, KEY_IMPORT_PATH);
+        String projectName = JsonUtils.extractStringArgument(params, McpKeys.PROJECT_NAME);
         String projectNature = JsonUtils.extractStringArgument(params, "projectNature"); //$NON-NLS-1$
         String xmlVersion = JsonUtils.extractStringArgument(params, "xmlVersion"); //$NON-NLS-1$
 
@@ -110,7 +115,7 @@ public class ImportConfigurationFromXmlTool implements IMcpTool
             // the AI agent gets a clear error instead of an opaque API
             // exception.
             Path importPath = Paths.get(importPathStr).toAbsolutePath().normalize();
-            boolean outsideWorkspace = isOutsideWorkspace(importPath);
+            boolean outsideWorkspace = WorkspacePaths.isOutsideWorkspace(importPath);
             if (outsideWorkspace)
             {
                 Activator.logWarning("import_configuration_from_xml: importPath is OUTSIDE the EDT workspace: " //$NON-NLS-1$
@@ -179,8 +184,8 @@ public class ImportConfigurationFromXmlTool implements IMcpTool
             FrontMatter fm = FrontMatter.create()
                 .put("tool", NAME) //$NON-NLS-1$
                 .put("status", "success") //$NON-NLS-1$ //$NON-NLS-2$
-                .put("project", projectName) //$NON-NLS-1$
-                .put("importPath", importPath.toString()); //$NON-NLS-1$
+                .put(McpKeys.PROJECT, projectName)
+                .put(KEY_IMPORT_PATH, importPath.toString());
             if (outsideWorkspace)
             {
                 fm.put("outsideWorkspace", true); //$NON-NLS-1$
@@ -199,46 +204,9 @@ public class ImportConfigurationFromXmlTool implements IMcpTool
 
             return fm.wrapContent(body.toString());
         }
-        catch (InvocationTargetException e)
-        {
-            Throwable cause = e.getCause() != null ? e.getCause() : e;
-            Activator.logError("import_configuration_from_xml failed", cause); //$NON-NLS-1$
-            return ToolResult.error("Import failed: " + cause.getMessage()).toJson(); //$NON-NLS-1$
-        }
-        catch (NoSuchMethodException | IllegalAccessException e)
-        {
-            Activator.logError("CLI API mismatch", e); //$NON-NLS-1$
-            return ToolResult.error("CLI API mismatch: " + e.getMessage()).toJson(); //$NON-NLS-1$
-        }
         catch (Exception e)
         {
-            Activator.logError("Unexpected error in import_configuration_from_xml", e); //$NON-NLS-1$
-            return ToolResult.error(e.getMessage()).toJson();
-        }
-    }
-
-    /**
-     * Returns true if {@code path} is not under the Eclipse workspace root.
-     * Used to flag (not block) configuration imports from external locations.
-     * Deliberately fails OPEN (returns false on any uncertainty): this is an
-     * advisory-only check, so a false negative merely omits a warning and never
-     * rejects a legitimate import.
-     */
-    private static boolean isOutsideWorkspace(Path path)
-    {
-        try
-        {
-            org.eclipse.core.runtime.IPath loc = ResourcesPlugin.getWorkspace().getRoot().getLocation();
-            if (loc == null)
-            {
-                return false;
-            }
-            Path wsRoot = loc.toFile().toPath().toAbsolutePath().normalize();
-            return !path.startsWith(wsRoot);
-        }
-        catch (Exception e)
-        {
-            return false; // cannot determine — do not flag
+            return CliReflectionErrors.toErrorJson(e, "Import", "CLI"); //$NON-NLS-1$ //$NON-NLS-2$
         }
     }
 }

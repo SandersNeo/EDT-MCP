@@ -6,21 +6,20 @@
 
 package com.ditrix.edt.mcp.server.tools.impl;
 
-import java.lang.reflect.Method;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
-import org.eclipse.core.runtime.Platform;
 import org.eclipse.debug.core.model.IDebugTarget;
-import org.osgi.framework.Bundle;
 
 import com.ditrix.edt.mcp.server.Activator;
 import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
 import com.ditrix.edt.mcp.server.protocol.JsonUtils;
+import com.ditrix.edt.mcp.server.protocol.McpKeys;
 import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
 import com.ditrix.edt.mcp.server.utils.DebugSessionRegistry;
+import com.ditrix.edt.mcp.server.utils.ProfilingSupport;
 
 /**
  * Starts 1C performance measurement on the active
@@ -45,9 +44,11 @@ public class StartProfilingTool implements IMcpTool
 {
     public static final String NAME = "start_profiling"; //$NON-NLS-1$
 
-    private static final String WIRING_BUNDLE = "com._1c.g5.wiring"; //$NON-NLS-1$
-    private static final String DEBUG_CORE_BUNDLE = "com._1c.g5.v8.dt.debug.core"; //$NON-NLS-1$
-    private static final String PROFILING_CORE_BUNDLE = "com._1c.g5.v8.dt.profiling.core"; //$NON-NLS-1$
+    /** Output key: whether profiling is currently active for the application id. */
+    private static final String KEY_ACTIVE = "active"; //$NON-NLS-1$
+
+    /** Output key: whether this call started profiling (vs. already active). */
+    private static final String KEY_STARTED = "started"; //$NON-NLS-1$
 
     /**
      * Shared on/off state, keyed by {@code applicationId}. The EDT profiling
@@ -121,7 +122,7 @@ public class StartProfilingTool implements IMcpTool
     public String getInputSchema()
     {
         return JsonSchemaBuilder.object()
-            .stringProperty("applicationId", "Application id of the running debug session (required)", true) //$NON-NLS-1$ //$NON-NLS-2$
+            .stringProperty(McpKeys.APPLICATION_ID, "Application id of the running debug session (required)", true) //$NON-NLS-1$
             .build();
     }
 
@@ -130,10 +131,10 @@ public class StartProfilingTool implements IMcpTool
     {
         return JsonSchemaBuilder.object()
             .booleanProperty("success", "Whether the operation succeeded", true) //$NON-NLS-1$ //$NON-NLS-2$
-            .booleanProperty("active", "Whether profiling is now active for this applicationId") //$NON-NLS-1$ //$NON-NLS-2$
-            .booleanProperty("started", "True if this call started profiling, false if already active") //$NON-NLS-1$ //$NON-NLS-2$
-            .stringProperty("applicationId", "Application id of the profiled debug session") //$NON-NLS-1$ //$NON-NLS-2$
-            .stringProperty("message", "Human-readable status and next-step guidance") //$NON-NLS-1$ //$NON-NLS-2$
+            .booleanProperty(KEY_ACTIVE, "Whether profiling is now active for this applicationId") //$NON-NLS-1$
+            .booleanProperty(KEY_STARTED, "True if this call started profiling, false if already active") //$NON-NLS-1$
+            .stringProperty(McpKeys.APPLICATION_ID, "Application id of the profiled debug session") //$NON-NLS-1$
+            .stringProperty(McpKeys.MESSAGE, "Human-readable status and next-step guidance") //$NON-NLS-1$
             .build();
     }
 
@@ -146,12 +147,12 @@ public class StartProfilingTool implements IMcpTool
     @Override
     public String execute(Map<String, String> params)
     {
-        String err = JsonUtils.requireArgument(params, "applicationId"); //$NON-NLS-1$
+        String err = JsonUtils.requireArgument(params, McpKeys.APPLICATION_ID);
         if (err != null)
         {
             return err;
         }
-        String applicationId = JsonUtils.extractStringArgument(params, "applicationId"); //$NON-NLS-1$
+        String applicationId = JsonUtils.extractStringArgument(params, McpKeys.APPLICATION_ID);
 
         try
         {
@@ -161,10 +162,10 @@ public class StartProfilingTool implements IMcpTool
             if (isProfilingActive(applicationId))
             {
                 return ToolResult.success()
-                    .put("active", true) //$NON-NLS-1$
-                    .put("started", false) //$NON-NLS-1$
-                    .put("applicationId", applicationId) //$NON-NLS-1$
-                    .put("message", "Profiling is already active for this applicationId. " //$NON-NLS-1$ //$NON-NLS-2$
+                    .put(KEY_ACTIVE, true)
+                    .put(KEY_STARTED, false)
+                    .put(McpKeys.APPLICATION_ID, applicationId)
+                    .put(McpKeys.MESSAGE, "Profiling is already active for this applicationId. " //$NON-NLS-1$
                         + "Run your test, then call stop_profiling and get_profiling_results.") //$NON-NLS-1$
                     .toJson();
             }
@@ -177,74 +178,24 @@ public class StartProfilingTool implements IMcpTool
                     + ". Start a debug session first (debug_launch or debug_yaxunit_tests).").toJson(); //$NON-NLS-1$
             }
 
-            // Check if target implements IProfileTarget (via adapter or directly)
-            Bundle debugBundle = Platform.getBundle(DEBUG_CORE_BUNDLE);
-            if (debugBundle == null)
+            // Resolve the profiling service + profile target and flip profiling on.
+            // Gated above on our shared OFF state, so this toggle deterministically
+            // switches profiling ON.
+            String toggleError = ProfilingSupport.toggleProfiling(target);
+            if (toggleError != null)
             {
-                return ToolResult.error("Debug core bundle not found").toJson(); //$NON-NLS-1$
+                return ToolResult.error(toggleError).toJson();
             }
-
-            Bundle profilingBundle = Platform.getBundle(PROFILING_CORE_BUNDLE);
-            if (profilingBundle == null)
-            {
-                return ToolResult.error("Profiling core bundle not found").toJson(); //$NON-NLS-1$
-            }
-
-            Class<?> profileTargetClass = profilingBundle.loadClass(
-                "com._1c.g5.v8.dt.profiling.core.IProfileTarget"); //$NON-NLS-1$
-
-            // Try to adapt the debug target to IProfileTarget
-            Object profileTarget = null;
-            if (profileTargetClass.isInstance(target))
-            {
-                profileTarget = target;
-            }
-            else
-            {
-                // Try Eclipse adapter mechanism
-                profileTarget = target.getAdapter(profileTargetClass);
-            }
-
-            if (profileTarget == null)
-            {
-                return ToolResult.error("Debug target does not support profiling. " //$NON-NLS-1$
-                    + "Target class: " + target.getClass().getName()).toJson(); //$NON-NLS-1$
-            }
-
-            // Get IProfilingService via ServiceAccess.get() — it manages the
-            // UUID↔target mapping needed for module resolution in results.
-            Bundle wiringBundle = Platform.getBundle(WIRING_BUNDLE);
-            if (wiringBundle == null)
-            {
-                return ToolResult.error("Wiring bundle not found").toJson(); //$NON-NLS-1$
-            }
-
-            Class<?> serviceAccessClass = wiringBundle.loadClass("com._1c.g5.wiring.ServiceAccess"); //$NON-NLS-1$
-            Class<?> profilingServiceClass = profilingBundle.loadClass(
-                "com._1c.g5.v8.dt.profiling.core.IProfilingService"); //$NON-NLS-1$
-            Method getService = serviceAccessClass.getMethod("get", Class.class); //$NON-NLS-1$
-            Object profilingService = getService.invoke(null, profilingServiceClass);
-            if (profilingService == null)
-            {
-                return ToolResult.error("IProfilingService not available").toJson(); //$NON-NLS-1$
-            }
-
-            // IProfilingService.toggleProfiling(IProfileTarget) — generates UUID
-            // internally, registers it in targets map, sends to debug server. Since
-            // we only call this when our state says profiling is OFF, this toggle
-            // deterministically switches it ON.
-            Method toggleProfiling = profilingServiceClass.getMethod("toggleProfiling", profileTargetClass); //$NON-NLS-1$
-            toggleProfiling.invoke(profilingService, profileTarget);
 
             markActive(applicationId);
 
             Activator.logInfo("Profiling started via IProfilingService for applicationId=" + applicationId); //$NON-NLS-1$
 
             return ToolResult.success()
-                .put("active", true) //$NON-NLS-1$
-                .put("started", true) //$NON-NLS-1$
-                .put("applicationId", applicationId) //$NON-NLS-1$
-                .put("message", "Profiling started. Run your test, then call stop_profiling " //$NON-NLS-1$ //$NON-NLS-2$
+                .put(KEY_ACTIVE, true)
+                .put(KEY_STARTED, true)
+                .put(McpKeys.APPLICATION_ID, applicationId)
+                .put(McpKeys.MESSAGE, "Profiling started. Run your test, then call stop_profiling " //$NON-NLS-1$
                     + "and get_profiling_results.") //$NON-NLS-1$
                 .toJson();
         }

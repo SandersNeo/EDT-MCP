@@ -19,12 +19,12 @@ import org.eclipse.ui.PlatformUI;
 import com._1c.g5.v8.bm.core.IBmObject;
 import com._1c.g5.v8.bm.integration.IBmModel;
 import com._1c.g5.v8.dt.core.platform.IBmModelManager;
-import com._1c.g5.v8.dt.core.platform.IConfigurationProvider;
 import com._1c.g5.v8.dt.metadata.mdclass.Configuration;
 import com._1c.g5.v8.dt.metadata.mdclass.MdObject;
 import com.ditrix.edt.mcp.server.Activator;
 import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
 import com.ditrix.edt.mcp.server.protocol.JsonUtils;
+import com.ditrix.edt.mcp.server.protocol.McpKeys;
 import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
 import com.ditrix.edt.mcp.server.tools.metadata.MetadataFormatterRegistry;
@@ -46,7 +46,10 @@ import com.ditrix.edt.mcp.server.utils.ProjectContext;
 public class GetMetadataDetailsTool implements IMcpTool
 {
     public static final String NAME = "get_metadata_details"; //$NON-NLS-1$
-    
+
+    /** Markdown separator between rendered object sections. */
+    private static final String SECTION_SEPARATOR = "\n---\n\n"; //$NON-NLS-1$
+
     @Override
     public String getName()
     {
@@ -70,7 +73,7 @@ public class GetMetadataDetailsTool implements IMcpTool
     public String getInputSchema()
     {
         return JsonSchemaBuilder.object()
-            .stringProperty("projectName", //$NON-NLS-1$
+            .stringProperty(McpKeys.PROJECT_NAME,
                 "EDT project name (required)", true) //$NON-NLS-1$
             .stringArrayProperty("objectFqns", //$NON-NLS-1$
                 "Required. FQNs as Type.Name, e.g. ['Catalog.Products', 'Document.SalesOrder']; " + //$NON-NLS-1$
@@ -97,7 +100,7 @@ public class GetMetadataDetailsTool implements IMcpTool
     @Override
     public String getResultFileName(Map<String, String> params)
     {
-        String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
+        String projectName = JsonUtils.extractStringArgument(params, McpKeys.PROJECT_NAME);
         if (projectName != null && !projectName.isEmpty())
         {
             return "metadata-details-" + projectName.toLowerCase() + ".md"; //$NON-NLS-1$ //$NON-NLS-2$
@@ -108,14 +111,14 @@ public class GetMetadataDetailsTool implements IMcpTool
     @Override
     public String execute(Map<String, String> params)
     {
-        String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
+        String projectName = JsonUtils.extractStringArgument(params, McpKeys.PROJECT_NAME);
         List<String> objectFqns = JsonUtils.extractArrayArgument(params, "objectFqns"); //$NON-NLS-1$
         String fullStr = JsonUtils.extractStringArgument(params, "full"); //$NON-NLS-1$
         boolean assignable = JsonUtils.extractBooleanArgument(params, "assignable", false); //$NON-NLS-1$
         String language = JsonUtils.extractStringArgument(params, "language"); //$NON-NLS-1$
 
         // Validate required parameters
-        String err = JsonUtils.requireArgument(params, "projectName"); //$NON-NLS-1$
+        String err = JsonUtils.requireArgument(params, McpKeys.PROJECT_NAME);
         if (err != null)
         {
             return err;
@@ -158,26 +161,14 @@ public class GetMetadataDetailsTool implements IMcpTool
     private String getMetadataDetailsInternal(String projectName, List<String> objectFqns,
                                                boolean full, boolean assignable, String language)
     {
-        // Get project
-        ProjectContext ctx = ProjectContext.of(projectName);
-        if (!ctx.exists())
+        // Resolve the project and its configuration
+        ProjectContext.ConfigurationResult resolved = ProjectContext.resolveConfiguration(projectName);
+        if (!resolved.ok())
         {
-            return ToolResult.error(ProjectContext.notFoundMessage(projectName)).toJson();
+            return resolved.errorJson();
         }
-        IProject project = ctx.project();
-        
-        // Get configuration
-        IConfigurationProvider configProvider = Activator.getDefault().getConfigurationProvider();
-        if (configProvider == null)
-        {
-            return ToolResult.error("Configuration provider not available").toJson(); //$NON-NLS-1$
-        }
-
-        Configuration config = configProvider.getConfiguration(project);
-        if (config == null)
-        {
-            return ToolResult.error("Could not get configuration for project: " + projectName).toJson(); //$NON-NLS-1$
-        }
+        IProject project = resolved.project();
+        Configuration config = resolved.configuration();
         
         // Determine language CODE for synonyms (the synonym map is keyed by code,
         // e.g. "ru"/"en", not by the Language object's name). May be null when the
@@ -219,7 +210,7 @@ public class GetMetadataDetailsTool implements IMcpTool
                     continue;
                 }
                 sb.append(formatAssignable(MetadataTypeUtils.normalizeFqn(fqn), node.object));
-                sb.append("\n---\n\n"); //$NON-NLS-1$
+                sb.append(SECTION_SEPARATOR);
                 continue;
             }
 
@@ -238,7 +229,7 @@ public class GetMetadataDetailsTool implements IMcpTool
                     continue;
                 }
                 sb.append(formStructure);
-                sb.append("\n---\n\n"); //$NON-NLS-1$
+                sb.append(SECTION_SEPARATOR);
                 continue;
             }
 
@@ -255,7 +246,7 @@ public class GetMetadataDetailsTool implements IMcpTool
             sb.append("\n**Origin:** ") //$NON-NLS-1$
                 .append(ExtensionOriginUtils.originLabel(mdObject.getObjectBelonging(), isExtensionProject))
                 .append("\n"); //$NON-NLS-1$
-            sb.append("\n---\n\n"); //$NON-NLS-1$
+            sb.append(SECTION_SEPARATOR);
         }
 
         if (!failures.isEmpty())

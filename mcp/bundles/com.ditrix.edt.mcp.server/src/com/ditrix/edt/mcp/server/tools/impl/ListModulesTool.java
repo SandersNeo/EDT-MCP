@@ -20,7 +20,6 @@ import org.eclipse.core.runtime.Path;
 import org.eclipse.swt.widgets.Display;
 import org.eclipse.ui.PlatformUI;
 
-import com._1c.g5.v8.dt.core.platform.IConfigurationProvider;
 import com._1c.g5.v8.dt.metadata.mdclass.AccumulationRegister;
 import com._1c.g5.v8.dt.metadata.mdclass.BusinessProcess;
 import com._1c.g5.v8.dt.metadata.mdclass.Catalog;
@@ -40,6 +39,7 @@ import com._1c.g5.v8.dt.metadata.mdclass.WebService;
 import com.ditrix.edt.mcp.server.Activator;
 import com.ditrix.edt.mcp.server.protocol.JsonSchemaBuilder;
 import com.ditrix.edt.mcp.server.protocol.JsonUtils;
+import com.ditrix.edt.mcp.server.protocol.McpKeys;
 import com.ditrix.edt.mcp.server.protocol.ToolResult;
 import com.ditrix.edt.mcp.server.tools.IMcpTool;
 import com.ditrix.edt.mcp.server.utils.BslModuleUtils;
@@ -77,7 +77,7 @@ public class ListModulesTool implements IMcpTool
     public String getInputSchema()
     {
         return JsonSchemaBuilder.object()
-            .stringProperty("projectName", //$NON-NLS-1$
+            .stringProperty(McpKeys.PROJECT_NAME,
                 "EDT project name (required)", true) //$NON-NLS-1$
             .enumProperty("metadataType", //$NON-NLS-1$
                 "Type filter, default 'all' (case-insensitive).", //$NON-NLS-1$
@@ -89,7 +89,7 @@ public class ListModulesTool implements IMcpTool
                 "Programmatic Name of one object to scope to, e.g. 'Products' (case-insensitive)") //$NON-NLS-1$
             .stringProperty("nameFilter", //$NON-NLS-1$
                 "Case-insensitive substring matched against the module path") //$NON-NLS-1$
-            .integerProperty("limit", //$NON-NLS-1$
+            .integerProperty(McpKeys.LIMIT,
                 "Max rows, default 200 (clamped to 1000)") //$NON-NLS-1$
             .build();
     }
@@ -103,7 +103,7 @@ public class ListModulesTool implements IMcpTool
     @Override
     public String getResultFileName(Map<String, String> params)
     {
-        String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
+        String projectName = JsonUtils.extractStringArgument(params, McpKeys.PROJECT_NAME);
         if (projectName != null && !projectName.isEmpty())
         {
             return "modules-" + projectName.toLowerCase() + ".md"; //$NON-NLS-1$ //$NON-NLS-2$
@@ -114,17 +114,17 @@ public class ListModulesTool implements IMcpTool
     @Override
     public String execute(Map<String, String> params)
     {
-        String err = JsonUtils.requireArgument(params, "projectName"); //$NON-NLS-1$
+        String err = JsonUtils.requireArgument(params, McpKeys.PROJECT_NAME);
         if (err != null)
         {
             return err;
         }
 
-        String projectName = JsonUtils.extractStringArgument(params, "projectName"); //$NON-NLS-1$
+        String projectName = JsonUtils.extractStringArgument(params, McpKeys.PROJECT_NAME);
         String metadataType = JsonUtils.extractStringArgument(params, "metadataType"); //$NON-NLS-1$
         String objectName = JsonUtils.extractStringArgument(params, "objectName"); //$NON-NLS-1$
         String nameFilter = JsonUtils.extractStringArgument(params, "nameFilter"); //$NON-NLS-1$
-        int limit = JsonUtils.extractIntArgument(params, "limit", 200); //$NON-NLS-1$
+        int limit = JsonUtils.extractIntArgument(params, McpKeys.LIMIT, 200);
 
         if (metadataType == null || metadataType.isEmpty())
         {
@@ -177,17 +177,12 @@ public class ListModulesTool implements IMcpTool
         }
 
         // For specific type filters, use EDT API
-        IConfigurationProvider configProvider = Activator.getDefault().getConfigurationProvider();
-        if (configProvider == null)
+        ProjectContext.ConfigurationResult resolved = ctx.resolveConfiguration();
+        if (!resolved.ok())
         {
-            return ToolResult.error("Configuration provider not available").toJson(); //$NON-NLS-1$
+            return resolved.errorJson();
         }
-
-        Configuration config = configProvider.getConfiguration(project);
-        if (config == null)
-        {
-            return ToolResult.error("Could not get configuration for project: " + projectName).toJson(); //$NON-NLS-1$
-        }
+        Configuration config = resolved.configuration();
 
         switch (type)
         {
