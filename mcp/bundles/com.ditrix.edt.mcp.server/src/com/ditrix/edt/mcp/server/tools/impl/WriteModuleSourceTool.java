@@ -618,24 +618,7 @@ public class WriteModuleSourceTool implements IMcpTool
         }
 
         // Determine default moduleType based on metadata type
-        if (moduleType == null || moduleType.isEmpty())
-        {
-            if ("CommonModule".equals(englishType) //$NON-NLS-1$
-                || "CommonForm".equals(englishType) //$NON-NLS-1$
-                || "WebService".equals(englishType) //$NON-NLS-1$
-                || "HTTPService".equals(englishType)) //$NON-NLS-1$
-            {
-                moduleType = MODULE_TYPE_MODULE;
-            }
-            else if ("CommonCommand".equals(englishType)) //$NON-NLS-1$
-            {
-                moduleType = MODULE_TYPE_COMMAND_MODULE;
-            }
-            else
-            {
-                moduleType = MODULE_TYPE_OBJECT_MODULE;
-            }
-        }
+        moduleType = resolveDefaultModuleType(moduleType, englishType);
 
         // Build path based on moduleType
         switch (moduleType)
@@ -681,6 +664,37 @@ public class WriteModuleSourceTool implements IMcpTool
                     ". Allowed: ObjectModule, ManagerModule, FormModule, " + //$NON-NLS-1$
                     "CommandModule, RecordSetModule, Module").toJson(); //$NON-NLS-1$
         }
+    }
+
+    /**
+     * Returns the supplied {@code moduleType} unchanged when it is non-empty,
+     * otherwise derives the default module type from the English metadata type:
+     * {@code Module} for module-bearing singletons (CommonModule, CommonForm,
+     * WebService, HTTPService), {@code CommandModule} for CommonCommand, and
+     * {@code ObjectModule} for everything else.
+     *
+     * @param moduleType the requested module type (may be {@code null} or empty)
+     * @param englishType the resolved English singular metadata type
+     * @return the explicit module type, or the derived default when none was given
+     */
+    private static String resolveDefaultModuleType(String moduleType, String englishType)
+    {
+        if (moduleType != null && !moduleType.isEmpty())
+        {
+            return moduleType;
+        }
+        if ("CommonModule".equals(englishType) //$NON-NLS-1$
+            || "CommonForm".equals(englishType) //$NON-NLS-1$
+            || "WebService".equals(englishType) //$NON-NLS-1$
+            || "HTTPService".equals(englishType)) //$NON-NLS-1$
+        {
+            return MODULE_TYPE_MODULE;
+        }
+        if ("CommonCommand".equals(englishType)) //$NON-NLS-1$
+        {
+            return MODULE_TYPE_COMMAND_MODULE;
+        }
+        return MODULE_TYPE_OBJECT_MODULE;
     }
 
     /**
