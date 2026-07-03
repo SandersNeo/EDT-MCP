@@ -12,6 +12,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Method;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
@@ -21,11 +22,13 @@ import java.util.Optional;
 import javax.imageio.ImageIO;
 
 import org.eclipse.emf.ecore.EObject;
+import org.eclipse.emf.ecore.EStructuralFeature;
 
 import com._1c.g5.v8.dt.md.MdPlugin;
 import com._1c.g5.v8.dt.md.pictures.MdPictureManifestProvider;
 import com._1c.g5.v8.dt.mcore.Picture;
 import com._1c.g5.v8.dt.platform.pictures.IPictureManifest;
+import com._1c.g5.v8.dt.platform.pictures.IPictureManifestQuery;
 import com._1c.g5.v8.dt.platform.pictures.PictureDirectionVariant;
 import com._1c.g5.v8.dt.platform.pictures.PictureInterfaceVariant;
 import com._1c.g5.v8.dt.platform.pictures.PictureThemeVariant;
@@ -61,14 +64,19 @@ import com.google.inject.Injector;
  * <li>A picture with several variants yields an {@link IZipPictureManifest};
  * {@code getZipPictureContent()} returns the {@link IZipPictureContent}. A single
  * (variant-less) picture yields a plain {@link IPictureManifest} — a valid, ordinary
- * single-image picture, NOT a corrupt one. This slice reads only the multi-variant
- * {@code Picture.zip} container, so such a picture is reported here as an empty variant
- * list (and {@link #exportPng} returns {@code null}); exporting a single-image picture
- * is a documented follow-up, not a defect.</li>
- * <li>Variants come from {@link IZipPictureContent#getPictureEntries()} as
+ * single-image picture whose image is stored as a loose {@code Picture.png}/{@code .svg}
+ * next to the {@code .mdo} (NOT inside a {@code Picture.zip}). Both cases are read here
+ * through the internal {@link PictureContent} abstraction: the multi-variant one wraps the
+ * {@link IZipPictureContent}; the single-image one exposes exactly one synthetic variant whose
+ * bytes come from {@code IPictureManifest.getInputStream(IPictureManifestQuery.DEFAULT)}. So a
+ * single-image picture yields a one-element variant list and {@link #exportPng} returns its PNG
+ * (previously it was silently reported as empty — the defect this class now fixes).</li>
+ * <li>Multi-variant entries come from {@link IZipPictureContent#getPictureEntries()} as
  * {@link IZipPictureManifestEntry} (the {@code manifest.xml} bookkeeping entry is
  * skipped). Bytes come from {@code getBufferedImageByName} (raster) or, for the
- * vector variant, {@code getInputStreamByName} + {@link SVGUtils}.</li>
+ * vector variant, {@code getInputStreamByName} + {@link SVGUtils}. In all cases decoding
+ * additionally falls back to {@link ImageIO#read(InputStream)} on the raw entry bytes when the
+ * zip API declares an entry it will not itself decode (e.g. a loose single-image {@code Picture.png}).</li>
  * </ol>
  * <p>
  * The provider reads through the <em>current</em> BM transaction, so every call
@@ -98,6 +106,17 @@ public final class CommonPictureContentReader
 
     /** Lowercase suffix identifying an SVG (vector) variant entry. */
     private static final String SVG_SUFFIX = ".svg"; //$NON-NLS-1$
+
+    /**
+     * Synthetic entry name for the single image of a variant-less picture. It mirrors the loose file
+     * stored next to the {@code .mdo} ({@code Picture.png}) so the reported/selectable variant name is
+     * familiar; a single-image SVG is reported as {@code Picture.svg} so the SVG rasterization branch
+     * kicks in.
+     */
+    private static final String SINGLE_IMAGE_ENTRY_PNG = "Picture.png"; //$NON-NLS-1$
+
+    /** Synthetic entry name for the single image of a variant-less SVG picture. */
+    private static final String SINGLE_IMAGE_ENTRY_SVG = "Picture.svg"; //$NON-NLS-1$
 
     /** The MD-injector-provided manifest provider; obtained lazily in the ctor. */
     private final MdPictureManifestProvider manifestProvider;
@@ -140,18 +159,14 @@ public final class CommonPictureContentReader
     public List<PictureVariantInfo> listVariants(EObject commonPicture) throws Exception
     {
         List<PictureVariantInfo> result = new ArrayList<>();
-        IZipPictureContent content = zipContentOf(commonPicture);
+        PictureContent content = contentOf(commonPicture);
         if (content == null)
         {
             return result;
         }
-        for (IZipPictureManifestEntry entry : content.getPictureEntries())
+        for (String name : content.variantNames())
         {
-            if (entry == null || isManifestEntry(entry.getName()))
-            {
-                continue;
-            }
-            result.add(toVariantInfo(entry, sizeOf(content, entry.getName())));
+            result.add(content.variantInfo(name));
         }
         return result;
     }
@@ -176,7 +191,7 @@ public final class CommonPictureContentReader
         {
             return null;
         }
-        IZipPictureContent content = zipContentOf(commonPicture);
+        PictureContent content = contentOf(commonPicture);
         if (content == null)
         {
             return null;
@@ -186,69 +201,43 @@ public final class CommonPictureContentReader
         if (VARIANT_BEST.equalsIgnoreCase(selector))
         {
             // 'best' = the densest RASTER variant by explicit screen-density rank (NOT entry order);
-            // fall back to the first entry for an SVG-only picture.
-            selected = selectBestRasterName(content);
+            // fall back to the first entry for an SVG-only picture (and the single synthetic entry of a
+            // variant-less single-image picture).
+            selected = content.selectBestRasterName();
             if (selected == null)
             {
-                List<String> names = variantNames(content);
+                List<String> names = content.variantNames();
                 selected = names.isEmpty() ? null : names.get(0);
             }
         }
         else
         {
-            selected = selectVariantName(variantNames(content), selector);
+            selected = selectVariantName(content.variantNames(), selector);
         }
         if (selected == null)
         {
             return null;
         }
-        byte[] png = decodeToPng(content, selected);
+        byte[] png = content.decodeToPng(selected);
         if (png == null)
         {
             // The entry EXISTS but could not be decoded (unsupported/corrupt content). Distinguish this
-            // from an unknown variant (which returns null) so the caller reports it accurately.
+            // from an unknown variant (which returns null) so the caller reports it accurately. Name the
+            // CommonPicture too (its programmatic name), so a failure in the workspace log identifies the
+            // exact picture and not merely the variant (e.g. the shared "Picture.png" entry name).
             throw new IOException("Could not decode variant '" + selected //$NON-NLS-1$
-                + "' of the CommonPicture (unsupported or corrupt content)."); //$NON-NLS-1$
+                + "' of CommonPicture " + pictureName(commonPicture) //$NON-NLS-1$
+                + " (unsupported or corrupt content)."); //$NON-NLS-1$
         }
         return new PngResult(selected, CONTENT_TYPE_PNG, png.length, Base64.getEncoder().encodeToString(png));
     }
 
     /**
-     * Selects the densest RASTER variant by explicit screen-density rank, so {@code "best"} does not
-     * depend on the manifest/zip entry order. SVG and manifest entries are skipped; the highest
-     * {@link PictureVariantScreenDensity} ordinal wins, ties break on the larger raw size then
-     * first-seen. Returns {@code null} when the picture has no raster variant (e.g. SVG-only).
-     *
-     * @param content the zip content
-     * @return the densest raster entry name, or {@code null}
-     */
-    private static String selectBestRasterName(IZipPictureContent content)
-    {
-        List<RasterCandidate> candidates = new ArrayList<>();
-        for (IZipPictureManifestEntry entry : content.getPictureEntries())
-        {
-            if (entry == null)
-            {
-                continue;
-            }
-            String name = entry.getName();
-            if (name == null || isManifestEntry(name) || isSvgName(name))
-            {
-                continue;
-            }
-            PictureVariantScreenDensity density = entry.getScreenDensity();
-            int rank = density != null ? density.ordinal() : -1;
-            candidates.add(new RasterCandidate(name, rank, sizeOf(content, name)));
-        }
-        return pickDensest(candidates);
-    }
-
-    /**
      * Picks the densest raster candidate: the highest density rank wins, ties break on the larger
      * raw size then first-seen. Returns {@code null} for an empty list. Pure (no model access) so it
-     * is unit-testable in isolation; {@link #selectBestRasterName} builds the candidates from the zip
-     * content (skipping SVG/manifest entries) — this is the ONLY {@code "best"} selection logic the
-     * tool runs.
+     * is unit-testable in isolation; {@link ZipPictureContent#selectBestRasterName} builds the
+     * candidates from the zip content (skipping SVG/manifest entries) — this is the ONLY {@code "best"}
+     * raster-selection logic the tool runs.
      *
      * @param candidates the raster candidates (already SVG/manifest-filtered)
      * @return the densest candidate's name, or {@code null} when the list is empty
@@ -294,88 +283,82 @@ public final class CommonPictureContentReader
     // ---------------------------------------------------------------------
 
     /**
-     * Resolves the {@link IZipPictureContent} of a picture, or {@code null} when the
-     * picture has no zip (multi-variant) content.
+     * Resolves the {@link PictureContent} of a picture: a {@link ZipPictureContent} wrapping the
+     * multi-variant {@link IZipPictureContent}, or a {@link SinglePictureContent} for an ordinary
+     * variant-less single-image picture (a plain {@link IPictureManifest} whose one image is a loose
+     * {@code Picture.png}/{@code .svg} next to the {@code .mdo}). Returns {@code null} when the object
+     * is not a {@link Picture}.
      *
      * @param commonPicture the resolved model object (an {@code mcore.Picture})
-     * @return the zip content, or {@code null} when the manifest is a plain
-     *         {@link IPictureManifest} (an ordinary single-image, variant-less picture —
-     *         a valid case; this slice does not export single-image pictures)
+     * @return the unified picture content, or {@code null} when the object is not a picture
      * @throws Exception on I/O or model-access failure
      */
-    private IZipPictureContent zipContentOf(EObject commonPicture) throws Exception
+    private PictureContent contentOf(EObject commonPicture) throws Exception
     {
         if (!(commonPicture instanceof Picture))
         {
             return null;
         }
         IPictureManifest manifest = manifestProvider.getPictureManifest((Picture)commonPicture);
-        if (!(manifest instanceof IZipPictureManifest))
+        if (manifest instanceof IZipPictureManifest)
+        {
+            IZipPictureContent zip = ((IZipPictureManifest)manifest).getZipPictureContent();
+            return zip == null ? null : new ZipPictureContent(zip);
+        }
+        if (manifest == null || manifest == IPictureManifest.UNRESOLVED_PICTURE_MANIFEST)
         {
             return null;
         }
-        return ((IZipPictureManifest)manifest).getZipPictureContent();
+        // A variant-less single-image picture: a plain IPictureManifest. Its image bytes come from
+        // getInputStream(IPictureManifestQuery.DEFAULT) (the raw loose Picture.png/.svg). Previously
+        // this arm was skipped, so single-image pictures showed "No variants" and failed to export.
+        return new SinglePictureContent(manifest);
     }
 
     /**
-     * Returns the byte size of one entry's raw content, or {@code 0} when it cannot
-     * be read.
+     * Rasterizes non-SVG raw bytes to PNG via {@link ImageIO}, returning the re-encoded PNG (or the
+     * original bytes when they already are a decodable PNG), or {@code null} when {@link ImageIO} cannot
+     * decode them. Shared by both content kinds: it is the fallback for a raster entry the zip API
+     * declares but will not itself decode (e.g. a loose single-image {@code Picture.png}).
      *
-     * @param content the zip content
-     * @param name the entry name
-     * @return the size in bytes, or {@code 0}
+     * @param raw the raw entry bytes (may be {@code null})
+     * @return the PNG bytes, or {@code null} when {@code raw} is {@code null}/empty or not decodable
+     * @throws IOException on an I/O failure while re-encoding
      */
-    private static long sizeOf(IZipPictureContent content, String name)
+    static byte[] rasterBytesToPng(byte[] raw) throws IOException
     {
-        Optional<ByteArrayInputStream> raw = content.getInputStreamByName(name);
-        if (raw.isPresent())
+        if (raw == null || raw.length == 0)
         {
-            return raw.get().available();
+            return null;
         }
-        return 0L;
+        BufferedImage image = ImageIO.read(new ByteArrayInputStream(raw));
+        if (image == null)
+        {
+            return null;
+        }
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        ImageIO.write(image, PNG_FORMAT, baos);
+        return baos.toByteArray();
     }
 
     /**
-     * Decodes one entry to PNG bytes: a raster entry via {@code getBufferedImageByName}
-     * → {@link ImageIO}; a vector entry via {@code getInputStreamByName} +
-     * {@link SVGUtils#renderSvgToPng(InputStream)}.
-     * <p>
-     * A raster (non-SVG) entry is decoded by {@code getBufferedImageByName}, which is
-     * {@code ImageIO.read} under the hood: it handles raster formats but returns
-     * {@code null} for an SVG stream, so the vector branch below cannot be folded into
-     * it. That vector branch is the ONLY use of {@code com.e1c.g5.v8.dt.svg} in this
-     * reader.
-     * <p>
-     * <b>Target portability (2025.2 AND 2026.1):</b> the SVG rasterizer signature differs by EDT
-     * version, so it is invoked reflectively via {@link #renderSvgToPngCompat(InputStream)} (2025.2's
-     * 1-arg {@code renderSvgToPng(InputStream)} or 2026.1's 3-arg form); the MANIFEST import spans
-     * both ranges ({@code com.e1c.g5.v8.dt.svg [1.0.0,3.0.0)}).
+     * Rasterizes SVG raw bytes to PNG bytes via {@link SVGUtils} (reflectively, see
+     * {@link #renderSvgToPngCompat(InputStream)}). Returns {@code null} when the SVG cannot be
+     * rasterized. Shared by both content kinds.
      *
-     * @param content the zip content
-     * @param name the entry name
-     * @return PNG bytes, or {@code null} when the entry cannot be decoded
-     * @throws Exception on I/O failure
+     * @param raw the raw SVG bytes (may be {@code null})
+     * @return the PNG bytes, or {@code null} when {@code raw} is {@code null}/empty or not rasterizable
+     * @throws Exception on an I/O or reflective failure
      */
-    private static byte[] decodeToPng(IZipPictureContent content, String name) throws Exception
+    private static byte[] svgBytesToPng(byte[] raw) throws Exception
     {
-        if (!isSvgName(name))
-        {
-            BufferedImage image = content.getBufferedImageByName(name);
-            if (image != null)
-            {
-                ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                ImageIO.write(image, PNG_FORMAT, baos);
-                return baos.toByteArray();
-            }
-        }
-        Optional<ByteArrayInputStream> raw = content.getInputStreamByName(name);
-        if (!raw.isPresent())
+        if (raw == null || raw.length == 0)
         {
             return null;
         }
         // Vector branch: rasterize via SVGUtils, called REFLECTIVELY so the reader works on both
-        // EDT targets (see renderSvgToPngCompat / this method's javadoc).
-        try (InputStream svgIn = raw.get())
+        // EDT targets (see renderSvgToPngCompat / its javadoc).
+        try (InputStream svgIn = new ByteArrayInputStream(raw))
         {
             InputStream pngIn = renderSvgToPngCompat(svgIn);
             if (pngIn == null)
@@ -391,6 +374,37 @@ public final class CommonPictureContentReader
                 pngIn.close();
             }
         }
+    }
+
+    /**
+     * Decodes one entry's raw bytes to PNG bytes: a raster entry via {@link #rasterBytesToPng(byte[])}
+     * ({@link ImageIO}); an SVG entry (by name) via {@link #svgBytesToPng(byte[])} ({@link SVGUtils}).
+     * <p>
+     * A raster (non-SVG) entry is decoded by {@link ImageIO}: it handles raster formats but returns
+     * {@code null} for an SVG stream, so the vector branch cannot be folded into it. That vector branch
+     * is the ONLY use of {@code com.e1c.g5.v8.dt.svg} in this reader.
+     * <p>
+     * <b>Target portability (2025.2 AND 2026.1):</b> the SVG rasterizer signature differs by EDT
+     * version, so it is invoked reflectively via {@link #renderSvgToPngCompat(InputStream)} (2025.2's
+     * 1-arg {@code renderSvgToPng(InputStream)} or 2026.1's 3-arg form); the MANIFEST import spans
+     * both ranges ({@code com.e1c.g5.v8.dt.svg [1.0.0,3.0.0)}).
+     *
+     * @param name the entry name (its {@code .svg} suffix routes to the vector branch)
+     * @param raw the raw entry bytes (may be {@code null})
+     * @return PNG bytes, or {@code null} when the entry cannot be decoded
+     * @throws Exception on I/O or reflective failure
+     */
+    private static byte[] decodeBytesToPng(String name, byte[] raw) throws Exception
+    {
+        if (!isSvgName(name))
+        {
+            byte[] png = rasterBytesToPng(raw);
+            if (png != null)
+            {
+                return png;
+            }
+        }
+        return svgBytesToPng(raw);
     }
 
     /**
@@ -429,54 +443,373 @@ public final class CommonPictureContentReader
         }
     }
 
+    // ---------------------------------------------------------------------
+    // Unified picture content (zip multi-variant OR single-image)
+    // ---------------------------------------------------------------------
+
     /**
-     * Collects the (non-manifest) variant entry names of a zip content.
-     *
-     * @param content the zip content
-     * @return the entry names, in enumeration order
+     * The content of a common picture, abstracting over the two shapes a picture takes on disk:
+     * <ul>
+     * <li>a multi-variant picture stored in a {@code Picture.zip} ({@link ZipPictureContent}); and</li>
+     * <li>an ordinary variant-less single-image picture stored as a loose {@code Picture.png}/{@code .svg}
+     * next to the {@code .mdo} ({@link SinglePictureContent}).</li>
+     * </ul>
+     * {@link #listVariants} and {@link #exportPng} drive both through this one interface, so a
+     * single-image picture yields exactly one variant instead of being silently skipped.
      */
-    private static List<String> variantNames(IZipPictureContent content)
+    private interface PictureContent
     {
-        List<String> names = new ArrayList<>();
-        for (IZipPictureManifestEntry entry : content.getPictureEntries())
-        {
-            if (entry == null || isManifestEntry(entry.getName()))
-            {
-                continue;
-            }
-            names.add(entry.getName());
-        }
-        return names;
+        /** @return the (non-manifest) variant/entry names, in enumeration order (never {@code null}). */
+        List<String> variantNames();
+
+        /**
+         * @param name a variant/entry name
+         * @return the variant descriptor for {@code name}
+         */
+        PictureVariantInfo variantInfo(String name);
+
+        /**
+         * @return the densest raster variant name for the {@code "best"} selector, or {@code null} when
+         *         there is no raster variant (e.g. an SVG-only picture)
+         */
+        String selectBestRasterName();
+
+        /**
+         * Decodes one variant/entry to PNG bytes.
+         *
+         * @param name the variant/entry name
+         * @return the PNG bytes, or {@code null} when the entry cannot be decoded
+         * @throws Exception on I/O or reflective failure
+         */
+        byte[] decodeToPng(String name) throws Exception;
     }
 
     /**
-     * Builds a {@link PictureVariantInfo} from a manifest entry and its byte size.
-     *
-     * @param entry the (non-manifest) picture variant entry
-     * @param sizeBytes the entry's raw byte size
-     * @return the variant descriptor
+     * {@link PictureContent} over the multi-variant {@link IZipPictureContent} of a {@code Picture.zip}
+     * (the pre-existing behaviour, unchanged: entries, {@code "best"} density ranking, raster/SVG decode).
      */
-    private static PictureVariantInfo toVariantInfo(IZipPictureManifestEntry entry, long sizeBytes)
+    private static final class ZipPictureContent implements PictureContent
     {
-        // Typed locals so each nullable 1C enum is read explicitly (and the enum
-        // types are used, not merely referenced from javadoc).
-        PictureVariantScreenDensity density = entry.getScreenDensity();
-        PictureThemeVariant theme = entry.getTheme();
-        PictureInterfaceVariant interfaceVariant = entry.getInterfaceVariant();
-        PictureDirectionVariant direction = entry.getPictureDirection();
+        private final IZipPictureContent content;
 
-        PictureVariantInfo info = new PictureVariantInfo();
-        info.name = entry.getName();
-        info.dpi = mapEnumLiteral(density);
-        info.theme = mapEnumLiteral(theme);
-        info.interfaceVariant = mapEnumLiteral(interfaceVariant);
-        info.pictureDirection = mapEnumLiteral(direction);
-        info.template = entry.isTemplate();
-        info.glyphWidth = entry.getGlyphWidth();
-        info.glyphHeight = entry.getGlyphHeight();
-        info.contentType = CONTENT_TYPE_PNG;
-        info.sizeBytes = sizeBytes;
-        return info;
+        ZipPictureContent(IZipPictureContent content)
+        {
+            this.content = content;
+        }
+
+        @Override
+        public List<String> variantNames()
+        {
+            List<String> names = new ArrayList<>();
+            for (IZipPictureManifestEntry entry : content.getPictureEntries())
+            {
+                if (entry == null || isManifestEntry(entry.getName()))
+                {
+                    continue;
+                }
+                names.add(entry.getName());
+            }
+            return names;
+        }
+
+        @Override
+        public PictureVariantInfo variantInfo(String name)
+        {
+            IZipPictureManifestEntry entry = entryByName(name);
+            long sizeBytes = sizeOf(name);
+            if (entry == null)
+            {
+                PictureVariantInfo info = new PictureVariantInfo();
+                info.name = name;
+                info.dpi = NONE;
+                info.theme = NONE;
+                info.interfaceVariant = NONE;
+                info.pictureDirection = NONE;
+                info.contentType = CONTENT_TYPE_PNG;
+                info.sizeBytes = sizeBytes;
+                return info;
+            }
+            // Typed locals so each nullable 1C enum is read explicitly (and the enum
+            // types are used, not merely referenced from javadoc).
+            PictureVariantScreenDensity density = entry.getScreenDensity();
+            PictureThemeVariant theme = entry.getTheme();
+            PictureInterfaceVariant interfaceVariant = entry.getInterfaceVariant();
+            PictureDirectionVariant direction = entry.getPictureDirection();
+
+            PictureVariantInfo info = new PictureVariantInfo();
+            info.name = entry.getName();
+            info.dpi = mapEnumLiteral(density);
+            info.theme = mapEnumLiteral(theme);
+            info.interfaceVariant = mapEnumLiteral(interfaceVariant);
+            info.pictureDirection = mapEnumLiteral(direction);
+            info.template = entry.isTemplate();
+            info.glyphWidth = entry.getGlyphWidth();
+            info.glyphHeight = entry.getGlyphHeight();
+            info.contentType = CONTENT_TYPE_PNG;
+            info.sizeBytes = sizeBytes;
+            return info;
+        }
+
+        @Override
+        public String selectBestRasterName()
+        {
+            List<RasterCandidate> candidates = new ArrayList<>();
+            for (IZipPictureManifestEntry entry : content.getPictureEntries())
+            {
+                if (entry == null)
+                {
+                    continue;
+                }
+                String name = entry.getName();
+                if (name == null || isManifestEntry(name) || isSvgName(name))
+                {
+                    continue;
+                }
+                PictureVariantScreenDensity density = entry.getScreenDensity();
+                int rank = density != null ? density.ordinal() : -1;
+                candidates.add(new RasterCandidate(name, rank, sizeOf(name)));
+            }
+            return pickDensest(candidates);
+        }
+
+        @Override
+        public byte[] decodeToPng(String name) throws Exception
+        {
+            // Prefer the zip API's own raster decode (getBufferedImageByName), preserving byte-identical
+            // multi-variant behaviour; fall back to raw-bytes ImageIO/SVG when it declares an entry it will
+            // not itself decode. Both the raster and raw-bytes reads probe case-variant spellings so a
+            // manifest/byte-entry case mismatch (manifest "Picture.png" vs stored "picture.png") still
+            // decodes instead of throwing.
+            if (!isSvgName(name))
+            {
+                BufferedImage image = bufferedImage(name);
+                if (image != null)
+                {
+                    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                    ImageIO.write(image, PNG_FORMAT, baos);
+                    return baos.toByteArray();
+                }
+            }
+            return decodeBytesToPng(name, rawBytes(name));
+        }
+
+        /**
+         * Reads one entry's decoded raster image, tolerating a manifest/byte-entry case mismatch: it
+         * probes the enumerated name first, then its lower/upper-cased spellings (see
+         * {@link #candidateNames(String)}). Returns {@code null} when no spelling yields a decodable image.
+         *
+         * @param name the enumerated (manifest) variant name
+         * @return the decoded image, or {@code null} when none of the case spellings resolves
+         */
+        private BufferedImage bufferedImage(String name)
+        {
+            for (String candidate : candidateNames(name))
+            {
+                BufferedImage image = content.getBufferedImageByName(candidate);
+                if (image != null)
+                {
+                    return image;
+                }
+            }
+            return null;
+        }
+
+        /**
+         * Finds the entry with the given name.
+         *
+         * @param name the entry name
+         * @return the entry, or {@code null} when not present
+         */
+        private IZipPictureManifestEntry entryByName(String name)
+        {
+            for (IZipPictureManifestEntry entry : content.getPictureEntries())
+            {
+                if (entry != null && name != null && name.equals(entry.getName()))
+                {
+                    return entry;
+                }
+            }
+            return null;
+        }
+
+        /**
+         * Reads one entry's raw bytes fully, or {@code null} when the entry cannot be read. Tolerates a
+         * manifest/byte-entry case mismatch by probing case-variant spellings (see
+         * {@link #resolveInputStream(String)}).
+         *
+         * @param name the entry name
+         * @return the raw bytes, or {@code null}
+         * @throws Exception on I/O failure
+         */
+        private byte[] rawBytes(String name) throws Exception
+        {
+            Optional<ByteArrayInputStream> raw = resolveInputStream(name);
+            if (!raw.isPresent())
+            {
+                return null;
+            }
+            try (InputStream in = raw.get())
+            {
+                return readAll(in);
+            }
+        }
+
+        /**
+         * Returns the byte size of one entry's raw content, or {@code 0} when it cannot be read. Tolerates
+         * a manifest/byte-entry case mismatch by probing case-variant spellings (see
+         * {@link #resolveInputStream(String)}).
+         *
+         * @param name the entry name
+         * @return the size in bytes, or {@code 0}
+         */
+        private long sizeOf(String name)
+        {
+            Optional<ByteArrayInputStream> raw = resolveInputStream(name);
+            if (raw.isPresent())
+            {
+                return raw.get().available();
+            }
+            return 0L;
+        }
+
+        /**
+         * Fetches an entry's raw byte stream, probing the enumerated name first and then its lower/upper-
+         * cased spellings ({@link #candidateNames(String)}). The zip content's
+         * {@code getInputStreamByName} is an exact, case-sensitive map lookup keyed by the ACTUAL byte-
+         * entry name, so this is what recovers the bytes of a picture whose {@code manifest.xml} declares
+         * a variant {@code "Picture.png"} while the zip stores it as {@code "picture.png"}. Returns the
+         * first spelling that yields bytes, else {@link Optional#empty()}.
+         *
+         * @param name the enumerated (manifest) variant name
+         * @return the byte stream of the first matching case spelling, or {@link Optional#empty()}
+         */
+        private Optional<ByteArrayInputStream> resolveInputStream(String name)
+        {
+            for (String candidate : candidateNames(name))
+            {
+                Optional<ByteArrayInputStream> raw = content.getInputStreamByName(candidate);
+                if (raw.isPresent())
+                {
+                    return raw;
+                }
+            }
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * {@link PictureContent} over a variant-less single-image picture (a plain {@link IPictureManifest}
+     * whose one image is a loose {@code Picture.png}/{@code .svg}). It exposes exactly one synthetic
+     * variant ({@link #SINGLE_IMAGE_ENTRY_PNG}, or {@link #SINGLE_IMAGE_ENTRY_SVG} when the image is an
+     * SVG) whose bytes come from {@code IPictureManifest.getInputStream(IPictureManifestQuery.DEFAULT)}.
+     */
+    private static final class SinglePictureContent implements PictureContent
+    {
+        private final IPictureManifest manifest;
+        private byte[] cachedBytes;
+        private boolean bytesRead;
+
+        SinglePictureContent(IPictureManifest manifest)
+        {
+            this.manifest = manifest;
+        }
+
+        @Override
+        public List<String> variantNames()
+        {
+            List<String> names = new ArrayList<>(1);
+            names.add(entryName());
+            return names;
+        }
+
+        @Override
+        public PictureVariantInfo variantInfo(String name)
+        {
+            PictureVariantInfo info = new PictureVariantInfo();
+            info.name = name != null ? name : entryName();
+            // A single-image picture carries no per-variant dpi/theme/interface/direction bookkeeping;
+            // report the neutral literal for each (matching the "-" the zip path uses for unset enums).
+            info.dpi = NONE;
+            info.theme = NONE;
+            info.interfaceVariant = NONE;
+            info.pictureDirection = NONE;
+            info.contentType = CONTENT_TYPE_PNG;
+            byte[] raw = rawBytesQuietly();
+            info.sizeBytes = raw != null ? raw.length : 0L;
+            return info;
+        }
+
+        @Override
+        public String selectBestRasterName()
+        {
+            // The single image is the best (and only) raster variant unless it is an SVG (then 'best'
+            // falls back to the first/only entry via the caller).
+            String name = entryName();
+            return isSvgName(name) ? null : name;
+        }
+
+        @Override
+        public byte[] decodeToPng(String name) throws Exception
+        {
+            return decodeBytesToPng(name != null ? name : entryName(), rawBytes());
+        }
+
+        /**
+         * The synthetic entry name: {@link #SINGLE_IMAGE_ENTRY_SVG} when the loose image looks like an
+         * SVG by content signature ({@link #looksLikeSvg}), else {@link #SINGLE_IMAGE_ENTRY_PNG} (a
+         * raster — or a corrupt/unreadable image, which then surfaces as a decode error, NOT as SVG).
+         *
+         * @return the synthetic entry name
+         */
+        private String entryName()
+        {
+            // Distinguish a vector single-image (SVG) from a raster by CONTENT signature, not by
+            // "ImageIO could not read it": a corrupt / empty / unsupported raster ALSO fails ImageIO
+            // and must keep the Picture.png name so it is reported as corrupt (via decodeToPng ->
+            // "Could not decode …") rather than mis-routed to the SVG rasterizer. (#224 review)
+            return looksLikeSvg(rawBytesQuietly()) ? SINGLE_IMAGE_ENTRY_SVG : SINGLE_IMAGE_ENTRY_PNG;
+        }
+
+        /**
+         * Reads (and caches) the single image's raw bytes from the manifest, or {@code null} when absent.
+         *
+         * @return the raw bytes, or {@code null}
+         * @throws Exception on I/O failure
+         */
+        private byte[] rawBytes() throws Exception
+        {
+            if (!bytesRead)
+            {
+                Optional<ByteArrayInputStream> raw = manifest.getInputStream(IPictureManifestQuery.DEFAULT);
+                if (raw.isPresent())
+                {
+                    try (InputStream in = raw.get())
+                    {
+                        cachedBytes = readAll(in);
+                    }
+                }
+                bytesRead = true;
+            }
+            return cachedBytes;
+        }
+
+        /**
+         * Reads the raw bytes swallowing I/O failure (returns {@code null}); used where a checked
+         * exception would be noise (size, entry-name probe).
+         *
+         * @return the raw bytes, or {@code null}
+         */
+        private byte[] rawBytesQuietly()
+        {
+            try
+            {
+                return rawBytes();
+            }
+            catch (Exception e) // NOSONAR a size/name probe degrades to "unknown", never aborts the read
+            {
+                return null;
+            }
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -525,6 +858,62 @@ public final class CommonPictureContentReader
     }
 
     /**
+     * Sniffs whether raw image bytes are an SVG, by CONTENT signature: an {@code <svg} tag in the
+     * head (after any {@code <?xml} prolog / BOM / comments / doctype). Used to tell a vector
+     * single-image apart from a raster that {@link ImageIO} merely failed to decode — a corrupt or
+     * unsupported raster does NOT contain {@code <svg} and so is kept as a raster (reported as a
+     * decode error), not mis-handled as SVG. Null/empty → {@code false}.
+     *
+     * @param raw the raw image bytes, may be {@code null}
+     * @return {@code true} when the head contains an {@code <svg} tag
+     */
+    static boolean looksLikeSvg(byte[] raw)
+    {
+        if (raw == null || raw.length == 0)
+        {
+            return false;
+        }
+        int len = Math.min(raw.length, 1024);
+        String head = new String(raw, 0, len, StandardCharsets.UTF_8).toLowerCase(Locale.ROOT);
+        return head.contains("<svg"); //$NON-NLS-1$
+    }
+
+    /**
+     * The ordered list of name spellings to probe when fetching an entry's raw bytes, tolerating a
+     * case mismatch between the {@code manifest.xml} variant name and the actual byte-entry name inside
+     * {@code Picture.zip}. The zip content's {@code getInputStreamByName}/{@code getBufferedImageByName}
+     * are an exact, case-sensitive map lookup keyed by the ACTUAL byte-entry name, whereas the enumerated
+     * variant name comes from the manifest — and real 1C configurations ship pictures whose manifest
+     * declares e.g. {@code "Picture.png"} while the zip stores the bytes as {@code "picture.png"} (seen
+     * in ERP common pictures with the DPI-percentage variant scheme {@code 85/100/.../400.png}). Probing
+     * the exact name first (so a correctly-cased picture stays byte-identical), then the lower/upper-cased
+     * forms, recovers those bytes. Distinct spellings only, in probe order; never {@code null}.
+     *
+     * @param name the enumerated (manifest) variant name, may be {@code null}
+     * @return the distinct case spellings to try, exact-first (empty when {@code name} is {@code null})
+     */
+    static List<String> candidateNames(String name)
+    {
+        List<String> candidates = new ArrayList<>(3);
+        if (name == null)
+        {
+            return candidates;
+        }
+        candidates.add(name);
+        String lower = name.toLowerCase(Locale.ROOT);
+        if (!candidates.contains(lower))
+        {
+            candidates.add(lower);
+        }
+        String upper = name.toUpperCase(Locale.ROOT);
+        if (!candidates.contains(upper))
+        {
+            candidates.add(upper);
+        }
+        return candidates;
+    }
+
+    /**
      * Resolves a {@code variant} selector against the available entry names.
      * <ul>
      * <li>{@code "svg"} → the first SVG entry (or {@code null} when the picture has
@@ -536,7 +925,8 @@ public final class CommonPictureContentReader
      * exactly. Returns {@code null} for a {@code null}/blank selector or an empty entry list.
      * <p>
      * The {@code "best"} selector is NOT handled here — {@link #exportPng} routes it to the
-     * density-ranked {@link #selectBestRasterName}; this method covers only {@code svg}/exact.
+     * density-ranked {@link ZipPictureContent#selectBestRasterName}; this method covers only
+     * {@code svg}/exact.
      *
      * @param names the available (non-manifest) entry names
      * @param variant the selector: {@code "svg"} or an exact name
@@ -568,6 +958,34 @@ public final class CommonPictureContentReader
             }
         }
         return null;
+    }
+
+    /**
+     * The programmatic name of a picture model object for diagnostics, read from its EMF {@code name}
+     * structural feature (present on {@code mdclass.CommonPicture}); {@code "<unknown>"} when the object
+     * is {@code null}, has no {@code name} feature, or the value is blank. Read via EMF reflection so the
+     * reader keeps its clean-room picture-API surface (no {@code mdclass} compile dependency) and works
+     * whether it is handed the {@code mcore.Picture} view or the concrete {@code CommonPicture}.
+     *
+     * @param object the picture model object (may be {@code null})
+     * @return the picture name, or {@code "<unknown>"} when it cannot be read
+     */
+    private static String pictureName(EObject object)
+    {
+        if (object == null)
+        {
+            return "<unknown>"; //$NON-NLS-1$
+        }
+        EStructuralFeature nameFeature = object.eClass().getEStructuralFeature("name"); //$NON-NLS-1$
+        if (nameFeature != null)
+        {
+            Object value = object.eGet(nameFeature);
+            if (value instanceof String && !((String)value).trim().isEmpty())
+            {
+                return (String)value;
+            }
+        }
+        return "<unknown>"; //$NON-NLS-1$
     }
 
     /**
